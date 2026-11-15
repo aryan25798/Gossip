@@ -1,474 +1,758 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { GoogleMap, useJsApiLoader, OverlayView, OverlayViewF, InfoWindow, MarkerClustererF } from '@react-google-maps/api';
-import { db } from '../../firebase';
-import { collection, query, onSnapshot, orderBy, limit, where, doc, getDoc } from 'firebase/firestore';
-import { format } from 'date-fns';
-import { Avatar } from '../ui/Avatar';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
+import L from 'leaflet';
+import { adminService } from '../../services/adminService';
+import { supabase } from '../../supabase';
 import { useAuth } from '../../contexts/AuthContext';
-import { Virtuoso } from 'react-virtuoso';
+import { format } from 'date-fns';
+import {
+    MapPin, Search, RefreshCw, Crosshair, ExternalLink,
+    Layers, AlertCircle, CheckCircle2, ChevronLeft, X,
+    Key, Settings, Globe, Shield, Radio, Check
+} from 'lucide-react';
 
-const containerStyle = {
-    width: '100%',
-    height: '100%'
-};
-
-// Tactical Dark Map Styles
-const mapOptions = {
-    disableDefaultUI: true,
-    zoomControl: false,
-    mapTypeControl: false,
-    streetViewControl: false,
-    scaleControl: false,
-    rotateControl: false,
-    fullscreenControl: false,
-    gestureHandling: 'greedy',
-    styles: [
-        { elementType: "geometry", stylers: [{ color: "#000000" }] },
-        { elementType: "labels.text.stroke", stylers: [{ color: "#000000" }] },
-        { elementType: "labels.text.fill", stylers: [{ color: "#333333" }] },
-        { featureType: "road", elementType: "geometry", stylers: [{ color: "#1a1a1a" }] },
-        { featureType: "water", elementType: "geometry", stylers: [{ color: "#0a0a0a" }] },
-        { featureType: "poi", stylers: [{ visibility: "off" }] },
-        { featureType: "transit", stylers: [{ visibility: "off" }] },
-    ],
-};
-
-const UserMarker = React.memo(({ user, onClick, batterySaver }) => (
-    <OverlayViewF
-        position={{ lat: user.lat, lng: user.lng }}
-        mapPaneName={OverlayView.OVERLAY_MOUSE_TARGET}
-    >
-        <div
-            onClick={(e) => {
-                e.stopPropagation();
-                onClick(user);
-            }}
-            className={`group cursor-pointer flex flex-col items-center -translate-x-1/2 -translate-y-full pb-2 hover:z-50 active:scale-95 transition-all duration-700 ease-[cubic-bezier(0.23,1,0.32,1)] ${user.isActive ? 'opacity-100 scale-100' : 'opacity-60 scale-90'}`}
-        >
-            {/* Pulsing Aura - Disabled in Battery Saver or Offline */}
-            {!batterySaver && user.isActive && (
-                <div className="absolute inset-0 w-12 h-12 -translate-x-1/2 -translate-y-[calc(100%+8px)] bg-cyan-500/10 rounded-full animate-ping pointer-events-none" />
-            )}
-
-            {/* User Avatar */}
-            <div className="relative">
-                <div className={`w-10 h-10 rounded-full border-2 p-0.5 bg-black transition-all duration-300 overflow-hidden flex items-center justify-center ${user.isActive ? 'border-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.4)] group-hover:shadow-[0_0_30px_rgba(34,211,238,0.8)]' : 'border-gray-600 grayscale brightness-50 shadow-none'}`}>
-                    <Avatar
-                        src={user.photoURL}
-                        alt={user.displayName}
-                        fallback={user.displayName?.[0]}
-                        className="w-full h-full rounded-full"
-                    />
-                </div>
-                {/* Online Indicator Dot */}
-                <div className={`absolute bottom-0 right-0 w-3 h-3 rounded-full border-2 border-black ${user.isActive ? 'bg-green-500 animate-pulse' : 'bg-gray-700'}`} />
-            </div>
-
-            {/* Name Label */}
-            <div className={`mt-1.5 px-2 py-0.5 bg-black/80 backdrop-blur-md border rounded-md shadow-lg transition-colors ${user.isActive ? 'border-cyan-500/30 text-white' : 'border-gray-800 text-gray-500'}`}>
-                <span className="text-[10px] font-black whitespace-nowrap uppercase tracking-widest leading-none">
-                    {user.displayName?.split(' ')[0] || 'Unknown'}
-                </span>
-            </div>
-
-            {/* Pointer Stem */}
-            <div className={`w-px h-2 mt-0.5 ${user.isActive ? 'bg-gradient-to-t from-transparent to-cyan-500/50' : 'bg-gray-800'}`} />
-        </div>
-    </OverlayViewF>
-));
-
-const GodMap = () => {
-    const [liveUsers, setLiveUsers] = useState([]);
-    const [selectedUser, setSelectedUser] = useState(null);
-    const [batterySaver, setBatterySaver] = useState(false);
-    const [lastSync, setLastSync] = useState(Date.now());
-    const [searchQuery, setSearchQuery] = useState('');
-    const [showSidebar, setShowSidebar] = useState(false);
-    const mapRef = useRef(null);
-    const { currentUser } = useAuth();
-    const updateBatchRef = useRef([]);
-    const lastUpdateRef = useRef(0);
-
-    const { isLoaded, loadError } = useJsApiLoader({
-        id: 'google-map-script',
-        googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_API_KEY
-    });
-
-    const [timeoutError, setTimeoutError] = useState(false);
-
+// Controller to smoothly pan & zoom to target coordinates
+function MapController({ selectedCoords }) {
+    const map = useMap();
     useEffect(() => {
-        if (!isLoaded && !loadError) {
-            const timer = setTimeout(() => {
-                setTimeoutError(true);
-            }, 8000);
-            return () => clearTimeout(timer);
+        if (selectedCoords && selectedCoords.lat && selectedCoords.lng) {
+            map.flyTo([selectedCoords.lat, selectedCoords.lng], 15, { duration: 1.5 });
         }
-    }, [isLoaded, loadError]);
+    }, [selectedCoords, map]);
+    return null;
+}
+
+// Custom HTML Avatar Marker for Leaflet
+const createAvatarIcon = (user) => {
+    const isOnline = Boolean(user.isOnline);
+    const borderColor = isOnline ? '#22d3ee' : '#64748b';
+    const glow = isOnline ? '0 0 15px rgba(34,211,238,0.7)' : 'none';
+    const avatarSrc = user.photoURL || `https://api.dicebear.com/9.x/avataaars/svg?seed=${user.userId || user.uid}`;
+
+    return L.divIcon({
+        className: 'radar-marker',
+        html: `
+            <div style="display: flex; flex-direction: column; align-items: center; cursor: pointer;">
+                <div style="position: relative; width: 40px; height: 40px; border-radius: 50%; border: 2.5px solid ${borderColor}; box-shadow: ${glow}; background: #0f172a; overflow: hidden;">
+                    <img src="${avatarSrc}" style="width: 100%; height: 100%; object-fit: cover;" onerror="this.src='https://api.dicebear.com/9.x/avataaars/svg?seed=fallback'" />
+                    <div style="position: absolute; bottom: 1px; right: 1px; width: 10px; height: 10px; border-radius: 50%; background: ${isOnline ? '#10b981' : '#64748b'}; border: 2px solid #0f172a;"></div>
+                </div>
+                <div style="margin-top: 4px; padding: 2px 8px; background: rgba(15,23,42,0.92); border: 1px solid rgba(34,211,238,0.4); border-radius: 6px; font-size: 10px; font-weight: 800; color: #f8fafc; text-transform: uppercase; white-space: nowrap; box-shadow: 0 4px 6px rgba(0,0,0,0.5);">
+                    ${(user.displayName || 'User').split(' ')[0]}
+                </div>
+            </div>
+        `,
+        iconSize: [40, 56],
+        iconAnchor: [20, 56],
+        popupAnchor: [0, -56]
+    });
+};
+
+export const GodMap = () => {
+    const { currentUser } = useAuth();
+    const [locations, setLocations] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [selectedUser, setSelectedUser] = useState(null);
+    const [lastSync, setLastSync] = useState(new Date());
+
+    // Responsive Drawer: Default open only on very wide desktop screens
+    const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1280);
+
+    // Active Map Engine: 'esri-dark', 'mappls', 'esri-sat', 'osm'
+    const [mapEngine, setMapEngine] = useState('esri-dark');
+    const [showLayerMenu, setShowLayerMenu] = useState(false);
+    const [showKeyModal, setShowKeyModal] = useState(false);
+
+    // MapmyIndia / Mappls Credentials state
+    const [mmiKey, setMmiKey] = useState(() => {
+        return localStorage.getItem('novachat_mmi_key') ||
+            import.meta.env.VITE_MAPMYINDIA_API_KEY ||
+            import.meta.env.VITE_MAPPLS_API_KEY ||
+            'dtbcmezcuovukpygcuegiuimtvizaohaamid';
+    });
+    const [inputKey, setInputKey] = useState(mmiKey);
+    const [mmiTestStatus, setMmiTestStatus] = useState(null); // { testing, valid, error }
+
+    const mapplsContainerRef = useRef(null);
+    const mapplsMapRef = useRef(null);
+    const mapplsMarkersRef = useRef([]);
+
+    // 1. Fetch initial user GPS records
+    const fetchLocations = useCallback(async () => {
+        try {
+            const data = await adminService.getUserLocations(currentUser);
+            const valid = (data || []).filter(u => u.lat && u.lng && !isNaN(u.lat) && !isNaN(u.lng));
+            setLocations(valid);
+            setLastSync(new Date());
+        } catch (err) {
+            console.error('[GodMap] Error fetching locations:', err);
+        } finally {
+            setLoading(false);
+        }
+    }, [currentUser]);
 
     useEffect(() => {
-        if (!currentUser) return;
+        fetchLocations();
+        // Fallback polling interval: 15s
+        const timer = setInterval(fetchLocations, 15000);
+        return () => clearInterval(timer);
+    }, [fetchLocations]);
 
-        // NEURAL SYNC: Fetch all known locations (Online + Offline)
-        // Scalability: We no longer filter by time here to show last known positions.
-        const q = query(
-            collection(db, 'user_locations')
-        );
+    // 2. Real-time GPS location streaming via Supabase Realtime Channel
+    useEffect(() => {
+        const channel = supabase
+            .channel('admin_user_locations_feed')
+            .on(
+                'postgres_changes',
+                { event: '*', schema: 'public', table: 'user_locations' },
+                (payload) => {
+                    const row = payload.new;
+                    if (!row || !row.latitude || !row.longitude) return;
 
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const users = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data()
-            })).filter(u => {
-                const isValid = u.lat && u.lng;
-                const isNotAdmin = !u.isAdmin && !u.superAdmin && u.email !== 'admin@system.com';
-                return isValid && isNotAdmin;
-            });
-
-            // THROTTLING: Batch updates to save DOM re-renders and CPU
-            const now = Date.now();
-            const delay = batterySaver ? 10000 : 3000; // 10s if saver on, 3s if off
-
-            if (now - lastUpdateRef.current >= delay) {
-                setLiveUsers(users);
-                setLastSync(now);
-                lastUpdateRef.current = now;
-            } else {
-                updateBatchRef.current = users;
-            }
-        });
-
-        // Forced Refresh Interval for batched data
-        const refreshInterval = setInterval(() => {
-            if (updateBatchRef.current.length > 0) {
-                setLiveUsers(updateBatchRef.current);
-                setLastSync(Date.now());
-                updateBatchRef.current = [];
-            }
-        }, 5000);
+                    setLocations((prev) => {
+                        const index = prev.findIndex(u => u.userId === row.user_id || u.uid === row.user_id);
+                        if (index >= 0) {
+                            const updated = [...prev];
+                            updated[index] = {
+                                ...updated[index],
+                                lat: row.latitude,
+                                lng: row.longitude,
+                                isOnline: row.is_online,
+                                platform: row.platform || updated[index].platform,
+                                updatedAt: row.updated_at || new Date().toISOString()
+                            };
+                            return updated;
+                        } else {
+                            fetchLocations();
+                            return prev;
+                        }
+                    });
+                    setLastSync(new Date());
+                }
+            )
+            .subscribe();
 
         return () => {
-            unsubscribe();
-            clearInterval(refreshInterval);
+            supabase.removeChannel(channel);
         };
-    }, [currentUser, batterySaver]);
+    }, [fetchLocations]);
 
-    const filteredUsers = useMemo(() => {
-        if (!searchQuery) return liveUsers;
-        return liveUsers.filter(u =>
-            u.displayName?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-            u.email?.toLowerCase().includes(searchQuery.toLowerCase())
-        );
-    }, [liveUsers, searchQuery]);
+    // 3. Test MapmyIndia / Mappls Key
+    const testMapmyIndiaKey = async (keyToTest) => {
+        const k = (keyToTest || mmiKey).trim();
+        if (!k) {
+            setMmiTestStatus({ testing: false, valid: false, error: 'Please enter a MapmyIndia / Mappls API key.' });
+            return;
+        }
 
-    const center = useMemo(() => ({ lat: 20, lng: 0 }), []);
-    const onLoad = useCallback((map) => { mapRef.current = map; }, []);
-    const onUnmount = useCallback(() => { mapRef.current = null; }, []);
-
-    const clusterOptions = {
-        gridSize: 50,
-        maxZoom: 15,
-        styles: [
-            {
-                textColor: 'white',
-                url: 'https://raw.githubusercontent.com/googlemaps/v3-utility-library/master/markerclustererplus/images/m1.png',
-                height: 50,
-                width: 50,
-                anchorText: [16, 16],
-                fontFamily: 'monospace',
-                fontWeight: 'bold'
+        setMmiTestStatus({ testing: true, valid: false, error: null });
+        try {
+            const res = await fetch(`https://apis.mappls.com/advancedmaps/api/${k}/map_sdk?v=3.0`, { method: 'GET' });
+            if (res.ok || res.status === 200) {
+                setMmiTestStatus({ testing: false, valid: true, error: null });
+            } else {
+                const text = await res.text();
+                let errMsg = `Server returned HTTP ${res.status}`;
+                try {
+                    const json = JSON.parse(text);
+                    if (json.error_description || json.error) {
+                        errMsg = json.error_description || json.error;
+                    }
+                } catch {
+                    // text error
+                }
+                setMmiTestStatus({ testing: false, valid: false, error: errMsg });
             }
-        ]
+        } catch (err) {
+            setMmiTestStatus({ testing: false, valid: false, error: err.message || 'Network error reaching MapmyIndia.' });
+        }
     };
 
-    if (loadError || timeoutError) {
-        // ... (Error UI kept as is for stability)
-        return (
-            <div className="h-full w-full flex flex-col items-center justify-center bg-black gap-6 font-mono p-8 text-center">
-                <div className="w-16 h-16 rounded-full bg-red-500/10 flex items-center justify-center border border-red-500 animate-pulse">
-                    <div className="w-8 h-8 bg-red-500 rounded-sm transform rotate-45" />
-                </div>
-                <div>
-                    <h3 className="text-red-500 font-black text-xl tracking-[0.2em] uppercase">Signal Lost</h3>
-                    <p className="text-red-400/60 text-xs mt-2 max-w-sm mx-auto leading-relaxed">卫星链路失败。</p>
-                </div>
-            </div>
-        );
-    }
+    // Save MapmyIndia Key
+    const handleSaveKey = () => {
+        const trimmed = inputKey.trim();
+        setMmiKey(trimmed);
+        localStorage.setItem('novachat_mmi_key', trimmed);
+        testMapmyIndiaKey(trimmed);
+    };
 
-    if (!isLoaded) return (
-        <div className="h-full w-full flex flex-col items-center justify-center bg-black gap-4 font-mono">
-            <div className="w-12 h-12 border-4 border-cyan-500 border-t-transparent rounded-full animate-spin shadow-[0_0_15px_cyan]" />
-            <span className="text-cyan-500 animate-pulse text-xs font-black tracking-widest uppercase">Initializing Global Marauder Net...</span>
-        </div>
-    );
+    // 4. Mappls SDK loader when 'mappls' engine is active
+    useEffect(() => {
+        if (mapEngine !== 'mappls' || !mmiKey) return;
+
+        let script = document.getElementById('mappls-sdk-script');
+        if (!script) {
+            script = document.createElement('script');
+            script.id = 'mappls-sdk-script';
+            script.src = `https://apis.mappls.com/advancedmaps/api/${mmiKey}/map_sdk?v=3.0`;
+            script.async = true;
+
+            script.onload = () => {
+                if (window.mappls || window.MapmyIndia) {
+                    initMapplsMap();
+                } else {
+                    setMapEngine('esri-dark');
+                }
+            };
+
+            script.onerror = () => {
+                setMapEngine('esri-dark');
+            };
+
+            document.head.appendChild(script);
+        } else if (window.mappls) {
+            initMapplsMap();
+        }
+    }, [mapEngine, mmiKey]);
+
+    const initMapplsMap = () => {
+        if (!window.mappls || !mapplsContainerRef.current) return;
+        try {
+            if (mapplsMapRef.current) return;
+            const center = locations.length > 0
+                ? [locations[0].lat, locations[0].lng]
+                : [20.5937, 78.9629];
+
+            mapplsMapRef.current = new window.mappls.Map(mapplsContainerRef.current, {
+                center,
+                zoom: 5
+            });
+
+            renderMapplsMarkers();
+        } catch (err) {
+            console.warn('[GodMap] Mappls init notice:', err);
+        }
+    };
+
+    const renderMapplsMarkers = () => {
+        if (!window.mappls || !mapplsMapRef.current) return;
+        mapplsMarkersRef.current.forEach(m => m.remove && m.remove());
+        mapplsMarkersRef.current = [];
+
+        locations.forEach(user => {
+            try {
+                const marker = new window.mappls.Marker({
+                    map: mapplsMapRef.current,
+                    position: { lat: user.lat, lng: user.lng },
+                    popupHtml: `
+                        <div style="font-family: sans-serif; font-size: 11px; padding: 6px; color: #0f172a;">
+                            <strong>${user.displayName || 'User'}</strong><br/>
+                            <span>${user.email || ''}</span><br/>
+                            <span>Status: ${user.isOnline ? 'Online' : 'Offline'}</span>
+                        </div>
+                    `
+                });
+                mapplsMarkersRef.current.push(marker);
+            } catch (e) {
+                console.debug('[GodMap] Mappls marker error:', e);
+            }
+        });
+    };
+
+    useEffect(() => {
+        if (mapEngine === 'mappls' && mapplsMapRef.current) {
+            renderMapplsMarkers();
+        }
+    }, [locations, mapEngine]);
+
+    const filteredUsers = useMemo(() => {
+        if (!searchQuery.trim()) return locations;
+        const q = searchQuery.toLowerCase();
+        return locations.filter(u =>
+            u.displayName?.toLowerCase().includes(q) ||
+            u.email?.toLowerCase().includes(q)
+        );
+    }, [locations, searchQuery]);
+
+    const onlineCount = useMemo(() => {
+        return locations.filter(u => u.isOnline).length;
+    }, [locations]);
+
+    const defaultCenter = useMemo(() => {
+        if (locations.length > 0) {
+            return [locations[0].lat, locations[0].lng];
+        }
+        return [20.5937, 78.9629]; // India / Global
+    }, [locations]);
+
+    const handleSelectNode = (user) => {
+        setSelectedUser(user);
+        if (mapEngine === 'mappls' && mapplsMapRef.current) {
+            try {
+                mapplsMapRef.current.setCenter([user.lat, user.lng]);
+                mapplsMapRef.current.setZoom(14);
+            } catch (e) {
+                console.debug(e);
+            }
+        }
+        // Auto-minimize drawer on mobile and tablet to view the map
+        if (window.innerWidth < 1280) {
+            setSidebarOpen(false);
+        }
+    };
 
     return (
-        <div className="h-full w-full relative z-0 bg-[#000000] overflow-hidden">
-            {/* Grid Line Overlay - Hidden in Battery Saver */}
-            {!batterySaver && (
-                <div className="absolute inset-0 bg-[linear-gradient(rgba(34,211,238,0.05)_1px,transparent_1px),linear-gradient(90deg,rgba(34,211,238,0.05)_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none z-10" />
-            )}
+        <div className="relative h-full w-full bg-slate-950 overflow-hidden font-sans select-none">
+            {/* Top Right Tactical Ribbon */}
+            <div className="absolute top-3 right-3 z-[1000] flex items-center gap-1.5 sm:gap-2">
+                {/* Active Provider Badge */}
+                <div className="hidden xs:flex px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-900/90 backdrop-blur-md border border-slate-800 text-xs font-semibold text-slate-200 shadow-xl items-center gap-1.5 sm:gap-2">
+                    <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0" />
+                    <span className="hidden md:inline text-slate-400">Provider:</span>
+                    <span className="text-cyan-400 font-bold uppercase tracking-wider text-[10px] sm:text-[11px] truncate max-w-[90px] sm:max-w-[150px] md:max-w-none">
+                        {mapEngine === 'mappls'
+                            ? 'Mappls'
+                            : mapEngine === 'esri-sat'
+                            ? 'Satellite'
+                            : mapEngine === 'osm'
+                            ? 'OpenStreetMap'
+                            : 'Esri Dark Gray'}
+                    </span>
+                </div>
 
-            <GoogleMap
-                mapContainerStyle={containerStyle}
-                center={center}
-                zoom={3}
-                options={mapOptions}
-                onLoad={onLoad}
-                onUnmount={onUnmount}
-                onClick={() => setSelectedUser(null)}
-            >
-                <MarkerClustererF options={clusterOptions}>
-                    {(clusterer) => (
-                        <>
-                            {liveUsers.map(user => (
-                                <UserMarker
-                                    key={user.id}
-                                    user={{
-                                        ...user,
-                                        isActive: user.timestamp?.toDate ? (Date.now() - user.timestamp.toDate().getTime() < 900000) : false
-                                    }}
-                                    clusterer={clusterer}
-                                    onClick={setSelectedUser}
-                                    batterySaver={batterySaver}
-                                />
-                            ))}
-                        </>
-                    )}
-                </MarkerClustererF>
-
-                {selectedUser && (
-                    <InfoWindow
-                        position={{ lat: selectedUser.lat, lng: selectedUser.lng }}
-                        onCloseClick={() => setSelectedUser(null)}
+                {/* Layer Switcher Button */}
+                <div className="relative">
+                    <button
+                        onClick={() => setShowLayerMenu(!showLayerMenu)}
+                        className="p-2 rounded-xl bg-slate-900/90 backdrop-blur-md border border-slate-800 text-cyan-400 hover:text-white hover:bg-slate-800 transition-all shadow-xl"
+                        title="Change Radar Layer"
                     >
-                        <div className="p-4 min-w-[300px] bg-[#0a0a0b] text-white font-mono rounded-xl overflow-hidden border border-cyan-500/40 shadow-[0_0_60px_rgba(0,0,0,0.9)] scale-105">
-                            <div className="flex items-center gap-5 mb-5 border-b border-white/10 pb-5">
-                                <div className="relative group">
-                                    <Avatar
-                                        src={selectedUser.photoURL}
-                                        alt={selectedUser.displayName}
-                                        fallback={selectedUser.displayName?.[0]}
-                                        className={`w-16 h-16 rounded-full border-2 shadow-[0_0_20px_rgba(34,211,238,0.4)] transition-transform group-hover:scale-110 ${selectedUser.timestamp?.toDate && (Date.now() - selectedUser.timestamp.toDate().getTime() < 900000) ? 'border-cyan-500' : 'border-gray-600 grayscale'}`}
-                                    />
-                                    <div className={`absolute bottom-0 right-0 w-5 h-5 rounded-full border-2 border-[#0a0a0b] ${selectedUser.timestamp?.toDate && (Date.now() - selectedUser.timestamp.toDate().getTime() < 900000) ? 'bg-green-500 animate-pulse' : 'bg-gray-700'} shadow-[0_0_10px_rgba(0,0,0,0.5)]`} />
-                                </div>
-                                <div className="min-w-0 flex-1">
-                                    <h3 className="font-black text-base text-cyan-400 truncate uppercase tracking-tighter leading-none mb-1">{selectedUser.displayName}</h3>
-                                    <p className="text-[11px] text-gray-400 truncate font-bold tracking-tight mb-2 opacity-80">{selectedUser.email}</p>
-                                    <div className="flex items-center gap-2">
-                                        <span className={`text-[10px] font-black uppercase tracking-[0.15em] px-2 py-0.5 rounded shadow-sm ${selectedUser.timestamp?.toDate && (Date.now() - selectedUser.timestamp.toDate().getTime() < 900000) ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-gray-500/20 text-gray-500 border border-gray-500/30'}`}>
-                                            {selectedUser.timestamp?.toDate && (Date.now() - selectedUser.timestamp.toDate().getTime() < 900000) ? 'Active Link' : 'Offline'}
-                                        </span>
-                                    </div>
-                                </div>
-                            </div>
+                        <Layers size={16} />
+                    </button>
 
-                            <div className="space-y-4">
-                                <div className="grid grid-cols-1 gap-2">
-                                    <div className="bg-white/5 p-3 rounded-lg border border-white/10 flex justify-between items-center">
-                                        <span className="text-[10px] text-gray-500 uppercase font-black tracking-widest">Global Coordinates</span>
-                                        <span className="text-xs text-cyan-400 font-bold tabular-nums">
-                                            {(selectedUser.lat || 0).toFixed(6)}, {(selectedUser.lng || 0).toFixed(6)}
-                                        </span>
-                                    </div>
-                                </div>
-
-                                <div className="space-y-2.5 bg-white/5 p-4 rounded-lg border border-white/10 shadow-inner">
-                                    <div className="flex justify-between items-center text-[11px]">
-                                        <span className="text-gray-500 uppercase font-black tracking-tighter">Identity Tag</span>
-                                        <span className="text-white font-mono font-bold bg-white/5 px-2 py-0.5 rounded text-[10px]">ID_{selectedUser.id.slice(-8).toUpperCase()}</span>
-                                    </div>
-                                    <div className="flex justify-between items-center text-[11px]">
-                                        <span className="text-gray-500 uppercase font-black tracking-tighter">Node Environment</span>
-                                        <span className="text-cyan-500 font-black uppercase italic">{selectedUser.platform || 'General Terminal'}</span>
-                                    </div>
-                                    <div className="flex justify-between items-center text-[11px]">
-                                        <span className="text-gray-500 uppercase font-black tracking-tighter">Last Seen</span>
-                                        <span className="text-white font-black uppercase">
-                                            {selectedUser.timestamp?.toDate ? format(selectedUser.timestamp.toDate(), 'MMM dd | HH:mm:ss') : 'Unknown'}
-                                        </span>
-                                    </div>
-                                </div>
+                    {showLayerMenu && (
+                        <div className="absolute right-0 top-11 w-64 bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-2 z-[1001] space-y-1 animate-in fade-in zoom-in-95 duration-150">
+                            <div className="px-3 py-1.5 text-[10px] font-bold uppercase text-slate-400 tracking-wider">
+                                Select Radar Engine
                             </div>
 
                             <button
                                 onClick={() => {
-                                    if (mapRef.current) {
-                                        mapRef.current.panTo({ lat: selectedUser.lat, lng: selectedUser.lng });
-                                        mapRef.current.setZoom(17);
-                                    }
+                                    setMapEngine('esri-dark');
+                                    setShowLayerMenu(false);
                                 }}
-                                className="w-full mt-5 py-3 bg-cyan-500 hover:bg-cyan-400 text-black text-[11px] font-black uppercase tracking-[0.2em] rounded-xl transition-all shadow-[0_5px_20px_rgba(34,211,238,0.3)] hover:shadow-[0_8px_25px_rgba(34,211,238,0.4)] active:scale-95 flex items-center justify-center gap-2"
+                                className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-between ${
+                                    mapEngine === 'esri-dark'
+                                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'
+                                        : 'text-slate-300 hover:bg-slate-800'
+                                }`}
                             >
-                                Neural Lock-On ⊕
+                                <div>
+                                    <span>Esri Dark Gray (Default Radar)</span>
+                                    <span className="block text-[10px] text-slate-400 font-normal">ArcGIS Dark Canvas · Zero Watermarks</span>
+                                </div>
+                                {mapEngine === 'esri-dark' && <CheckCircle2 size={13} className="text-cyan-400 shrink-0" />}
+                            </button>
+
+                            <button
+                                onClick={() => {
+                                    setMapEngine('mappls');
+                                    setShowLayerMenu(false);
+                                }}
+                                className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-between ${
+                                    mapEngine === 'mappls'
+                                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'
+                                        : 'text-slate-300 hover:bg-slate-800'
+                                }`}
+                            >
+                                <div>
+                                    <span>MapmyIndia Mappls</span>
+                                    <span className="block text-[10px] text-slate-400 font-normal">Vector Maps SDK</span>
+                                </div>
+                                {mapEngine === 'mappls' && <CheckCircle2 size={13} className="text-cyan-400 shrink-0" />}
+                            </button>
+
+                            <button
+                                onClick={() => {
+                                    setMapEngine('esri-sat');
+                                    setShowLayerMenu(false);
+                                }}
+                                className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-between ${
+                                    mapEngine === 'esri-sat'
+                                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'
+                                        : 'text-slate-300 hover:bg-slate-800'
+                                }`}
+                            >
+                                <div>
+                                    <span>Satellite Imagery</span>
+                                    <span className="block text-[10px] text-slate-400 font-normal">Esri High-Resolution World Photo</span>
+                                </div>
+                                {mapEngine === 'esri-sat' && <CheckCircle2 size={13} className="text-cyan-400 shrink-0" />}
+                            </button>
+
+                            <button
+                                onClick={() => {
+                                    setMapEngine('osm');
+                                    setShowLayerMenu(false);
+                                }}
+                                className={`w-full text-left px-3 py-2 rounded-xl text-xs font-semibold transition-colors flex items-center justify-between ${
+                                    mapEngine === 'osm'
+                                        ? 'bg-cyan-950 text-cyan-300 border border-cyan-500/40'
+                                        : 'text-slate-300 hover:bg-slate-800'
+                                }`}
+                            >
+                                <div>
+                                    <span>OpenStreetMap Standard</span>
+                                    <span className="block text-[10px] text-slate-400 font-normal">Global Street & Landmark Grid</span>
+                                </div>
+                                {mapEngine === 'osm' && <CheckCircle2 size={13} className="text-cyan-400 shrink-0" />}
                             </button>
                         </div>
-                    </InfoWindow>
-                )}
-            </GoogleMap>
-
-            {/* Floating Hamburger Toggle */}
-            <button
-                onClick={() => setShowSidebar(!showSidebar)}
-                className={`absolute top-6 left-6 z-50 p-3 rounded-full border backdrop-blur-xl transition-all duration-500 hover:scale-110 active:scale-95 shadow-2xl ${showSidebar ? 'bg-cyan-500 border-cyan-400 text-black shadow-[0_0_20px_rgba(34,211,238,0.5)]' : 'bg-black/60 border-cyan-500/30 text-cyan-400 hover:border-cyan-400'}`}
-            >
-                <div className="flex flex-col gap-1 w-5 h-4 justify-between items-center">
-                    <div className={`h-[2px] w-full bg-current rounded-full transition-transform duration-500 ${showSidebar ? 'translate-y-[7px] rotate-45' : ''}`} />
-                    <div className={`h-[2px] w-full bg-current rounded-full transition-opacity duration-300 ${showSidebar ? 'opacity-0' : ''}`} />
-                    <div className={`h-[2px] w-full bg-current rounded-full transition-transform duration-500 ${showSidebar ? '-translate-y-[7px] -rotate-45' : ''}`} />
+                    )}
                 </div>
-            </button>
-            <div className={`absolute top-8 left-8 bottom-8 flex flex-col gap-4 z-20 pointer-events-auto transition-all duration-700 ease-[cubic-bezier(0.23,1,0.32,1)] ${showSidebar ? 'translate-x-0 opacity-100' : '-translate-x-[120%] opacity-0'}`}>
-                {/* Tactical Control Sidebar */}
-                <div className="bg-black/40 backdrop-blur-xl border border-white/10 p-6 rounded-2xl shadow-2xl min-w-[320px] shrink-0">
-                    <div className="flex items-center justify-between mb-6 pb-4 border-b border-white/10">
-                        <div className="flex flex-col">
-                            <h3 className="font-black text-[11px] tracking-[0.4em] text-cyan-400 uppercase leading-none">Marauder System</h3>
-                            <div className="flex items-center gap-2 mt-2">
-                                <span className="text-[7px] text-green-500 font-black tracking-widest uppercase">v3.0 // Tactical Link</span>
-                                <div className="w-1 h-1 rounded-full bg-green-500 animate-pulse" />
-                            </div>
-                        </div>
-                        <button
-                            onClick={() => setBatterySaver(!batterySaver)}
-                            className={`px-3 py-1 rounded-full border text-[8px] font-black uppercase tracking-widest transition-all ${batterySaver ? 'bg-amber-500/20 border-amber-500/50 text-amber-500' : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-500'}`}
+
+                {/* Map & License Settings Button */}
+                <button
+                    onClick={() => {
+                        setShowKeyModal(true);
+                        testMapmyIndiaKey();
+                    }}
+                    className="p-2 rounded-xl bg-slate-900/90 backdrop-blur-md border border-slate-800 text-slate-300 hover:text-white hover:bg-slate-800 transition-all shadow-xl"
+                    title="MapmyIndia License & Key Settings"
+                >
+                    <Settings size={16} />
+                </button>
+            </div>
+
+            {/* Map Rendering Container */}
+            {mapEngine === 'mappls' ? (
+                <div
+                    ref={mapplsContainerRef}
+                    id="mappls-map-canvas"
+                    className="h-full w-full bg-slate-900"
+                />
+            ) : (
+                <MapContainer
+                    center={defaultCenter}
+                    zoom={4}
+                    maxZoom={19}
+                    style={{ height: '100%', width: '100%', background: '#0a0e17' }}
+                    zoomControl={false}
+                >
+                    {/* Zero-Watermark Dynamic Tile Layers */}
+                    {mapEngine === 'esri-sat' ? (
+                        <TileLayer
+                            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                            attribution='&copy; <a href="https://www.esri.com/">Esri</a>'
+                            maxZoom={19}
+                        />
+                    ) : mapEngine === 'osm' ? (
+                        <TileLayer
+                            url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                            maxZoom={19}
+                        />
+                    ) : (
+                        <>
+                            {/* Esri World Dark Gray Base (Clean dark vector background, NO watermarks!) */}
+                            <TileLayer
+                                url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+                                attribution='&copy; <a href="https://www.esri.com/">Esri</a> &mdash; Dark Gray Canvas'
+                                maxZoom={19}
+                                maxNativeZoom={16}
+                            />
+                            {/* Reference Labels Layer */}
+                            <TileLayer
+                                url="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}"
+                                maxZoom={19}
+                                maxNativeZoom={16}
+                            />
+                        </>
+                    )}
+
+                    <MapController selectedCoords={selectedUser} />
+
+                    {/* Interactive Tactical Markers */}
+                    {filteredUsers.map((user) => (
+                        <Marker
+                            key={user.userId || user.uid}
+                            position={[user.lat, user.lng]}
+                            icon={createAvatarIcon(user)}
+                            eventHandlers={{
+                                click: () => setSelectedUser(user)
+                            }}
                         >
-                            {batterySaver ? 'Battery: Eco' : 'Battery: Performance'}
-                        </button>
-                    </div>
+                            <Popup className="tactical-popup">
+                                <div className="p-3 bg-slate-900 text-white rounded-xl font-sans min-w-[220px]">
+                                    <div className="flex items-center gap-3 mb-2.5 pb-2.5 border-b border-slate-800">
+                                        <div className="w-10 h-10 rounded-full overflow-hidden border border-cyan-400 shrink-0">
+                                            <img
+                                                src={user.photoURL || `https://api.dicebear.com/9.x/avataaars/svg?seed=${user.userId}`}
+                                                alt=""
+                                                className="w-full h-full object-cover"
+                                            />
+                                        </div>
+                                        <div className="min-w-0">
+                                            <h4 className="font-bold text-xs text-cyan-400 truncate uppercase">
+                                                {user.displayName || 'Anonymous'}
+                                            </h4>
+                                            <p className="text-[10px] text-slate-400 truncate">{user.email}</p>
+                                        </div>
+                                    </div>
 
-                    <div className="space-y-6">
-                        <div className="flex items-end justify-between">
-                            <div className="flex flex-col">
-                                <span className="text-[9px] font-bold text-gray-500 tracking-[0.2em] uppercase mb-1">Total Nodes</span>
-                                <span className="text-4xl font-black text-white italic tracking-tighter tabular-nums drop-shadow-[0_0_10px_rgba(255,255,255,0.3)]">
-                                    {liveUsers.length}
-                                </span>
-                            </div>
-                            <div className="flex flex-col items-end">
-                                <span className="text-[9px] font-bold text-cyan-500/50 tracking-widest uppercase italic mb-2">Sync Delta</span>
-                                <span className="text-[10px] font-mono font-bold text-green-500">
-                                    {Math.floor((Date.now() - lastSync) / 1000)}s
-                                </span>
-                            </div>
-                        </div>
+                                    <div className="space-y-1.5 text-[10px] text-slate-300">
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500 font-semibold uppercase">Status:</span>
+                                            <span className={user.isOnline ? 'text-emerald-400 font-bold' : 'text-slate-500'}>
+                                                {user.isOnline ? '● Online' : '○ Offline'}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500 font-semibold uppercase">Coordinates:</span>
+                                            <span className="font-mono text-cyan-300">
+                                                {user.lat.toFixed(4)}, {user.lng.toFixed(4)}
+                                            </span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500 font-semibold uppercase">Terminal:</span>
+                                            <span className="truncate max-w-[120px]">{user.platform || 'Web Browser'}</span>
+                                        </div>
+                                        <div className="flex justify-between">
+                                            <span className="text-slate-500 font-semibold uppercase">Live Telemetry:</span>
+                                            <span>{user.updatedAt ? format(new Date(user.updatedAt), 'HH:mm:ss') : 'Just now'}</span>
+                                        </div>
+                                    </div>
 
-                        <div className="space-y-3">
-                            <div className="flex justify-between text-[8px] font-bold text-gray-500 uppercase tracking-widest px-1">
-                                <span>Active Spectrum</span>
-                                <span className="text-cyan-400">
-                                    {liveUsers.filter(u => u.timestamp?.toDate && (Date.now() - u.timestamp.toDate().getTime() < 900000)).length} NODES
-                                </span>
-                            </div>
-                            <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden">
-                                <div
-                                    className="h-full bg-cyan-500 transition-all duration-1000"
-                                    style={{ width: `${(liveUsers.filter(u => u.timestamp?.toDate && (Date.now() - u.timestamp.toDate().getTime() < 900000)).length / Math.max(1, liveUsers.length)) * 100}%` }}
-                                />
-                            </div>
-                        </div>
-                    </div>
+                                    <a
+                                        href={`https://www.google.com/maps?q=${user.lat},${user.lng}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="mt-3 w-full py-1.5 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-400 rounded-lg text-[10px] font-bold uppercase tracking-wider flex items-center justify-center gap-1.5 transition-colors border border-cyan-500/40"
+                                    >
+                                        <ExternalLink size={12} />
+                                        <span>Satellite View</span>
+                                    </a>
+                                </div>
+                            </Popup>
+                        </Marker>
+                    ))}
+                </MapContainer>
+            )}
 
-                    <div className="mt-8 pt-4 border-t border-white/5 opacity-40">
-                        <p className="text-[6px] font-mono text-gray-500 text-center uppercase tracking-[0.4em] leading-relaxed">
-                            Encrypted Neural Path • Adaptive Throttling Active
+            {/* Smart Responsive Tactical Drawer */}
+            <div
+                className={`absolute top-3 left-3 bottom-3 z-[1000] w-72 sm:w-80 max-w-[calc(100vw-24px)] bg-slate-900/95 backdrop-blur-md border border-slate-800 rounded-2xl shadow-2xl flex flex-col transition-all duration-300 overflow-hidden ${
+                    sidebarOpen ? 'translate-x-0' : '-translate-x-[calc(100%+24px)] pointer-events-none'
+                }`}
+            >
+                {/* Drawer Header */}
+                <div className="p-3.5 border-b border-slate-800 flex items-center justify-between shrink-0">
+                    <div>
+                        <h3 className="font-bold text-xs tracking-wider text-cyan-400 uppercase flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse shrink-0" />
+                            Location Radar
+                        </h3>
+                        <p className="text-[10px] text-slate-400 mt-0.5">
+                            {onlineCount} active nodes / {locations.length} tracked
                         </p>
                     </div>
+
+                    <div className="flex items-center gap-1">
+                        <button
+                            onClick={fetchLocations}
+                            className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white transition-colors"
+                            title="Force Radar Sync"
+                        >
+                            <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+                        </button>
+                        <button
+                            onClick={() => setSidebarOpen(false)}
+                            className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white transition-colors"
+                            title="Close drawer"
+                        >
+                            <X size={14} />
+                        </button>
+                    </div>
                 </div>
 
-                {/* Industrial User List */}
-                <div className="bg-black/60 backdrop-blur-2xl border border-cyan-500/20 rounded-2xl shadow-2xl min-w-[300px] flex flex-col flex-1 min-h-0 overflow-hidden">
-                    <div className="p-4 border-b border-white/5">
-                        <div className="relative">
-                            <input
-                                type="text"
-                                placeholder="Search Neural Nodes..."
-                                value={searchQuery}
-                                onChange={(e) => setSearchQuery(e.target.value)}
-                                className="w-full bg-white/5 border border-white/10 rounded-lg py-2 px-3 text-[10px] text-cyan-400 font-mono placeholder:text-gray-600 focus:outline-none focus:border-cyan-500/50 transition-colors"
-                            />
-                            <div className="absolute right-3 top-1/2 -translate-y-1/2 size-1.5 rounded-full bg-cyan-500 shadow-[0_0_5px_cyan]" />
-                        </div>
+                {/* Search Bar (Generous padding so icon never overlaps text) */}
+                <div className="p-3 border-b border-slate-800 shrink-0">
+                    <div className="relative">
+                        <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 shrink-0" />
+                        <input
+                            type="text"
+                            placeholder="Filter tracked nodes..."
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            className="w-full pl-10 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                        />
                     </div>
+                </div>
 
-                    <div className="flex-1 min-h-0 overflow-hidden">
-                        {filteredUsers.length === 0 ? (
-                            <div className="py-8 text-center opacity-30">
-                                <span className="text-[8px] font-black uppercase tracking-[0.2em]">No Nodes Found</span>
+                {/* Nodes List */}
+                <div className="flex-1 overflow-y-auto divide-y divide-slate-800/60 custom-scrollbar p-2 space-y-1">
+                    {filteredUsers.length === 0 ? (
+                        <div className="text-center py-12 text-slate-500 text-xs px-4">
+                            {locations.length === 0
+                                ? 'No user GPS coordinates recorded yet. Ensure client location services are enabled.'
+                                : 'No matching nodes found.'}
+                        </div>
+                    ) : (
+                        filteredUsers.map((user) => (
+                            <div
+                                key={user.userId || user.uid}
+                                onClick={() => handleSelectNode(user)}
+                                className={`p-2.5 rounded-xl cursor-pointer transition-all flex items-center justify-between gap-3 ${
+                                    selectedUser?.userId === user.userId
+                                        ? 'bg-cyan-950/50 border border-cyan-500/50 text-white'
+                                        : 'hover:bg-slate-800/60 text-slate-300'
+                                }`}
+                            >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                    <div className="relative w-8 h-8 rounded-full overflow-hidden border border-slate-700 shrink-0">
+                                        <img
+                                            src={user.photoURL || `https://api.dicebear.com/9.x/avataaars/svg?seed=${user.userId}`}
+                                            alt=""
+                                            className="w-full h-full object-cover"
+                                        />
+                                        <div
+                                            className={`absolute bottom-0 right-0 w-2 h-2 rounded-full border border-slate-900 ${
+                                                user.isOnline ? 'bg-emerald-500' : 'bg-slate-600'
+                                            }`}
+                                        />
+                                    </div>
+                                    <div className="min-w-0">
+                                        <p className="text-xs font-bold truncate text-slate-200">
+                                            {user.displayName || 'User'}
+                                        </p>
+                                        <p className="text-[10px] text-slate-400 font-mono truncate">
+                                            {user.lat.toFixed(2)}, {user.lng.toFixed(2)}
+                                        </p>
+                                    </div>
+                                </div>
+
+                                <button
+                                    onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleSelectNode(user);
+                                    }}
+                                    className="p-1.5 rounded-lg bg-slate-800 hover:bg-cyan-500/20 text-slate-400 hover:text-cyan-400 transition-colors shrink-0"
+                                    title="Lock-On to coordinates"
+                                >
+                                    <Crosshair size={14} />
+                                </button>
                             </div>
-                        ) : (
-                            <Virtuoso
-                                data={filteredUsers}
-                                className="custom-scrollbar"
-                                style={{ height: '100%' }}
-                                itemContent={(index, user) => {
-                                    const isUserActive = user.timestamp?.toDate && (Date.now() - user.timestamp.toDate().getTime() < 900000);
-                                    return (
-                                        <div className="p-1 px-2">
-                                            <div
-                                                key={user.id}
-                                                onClick={() => {
-                                                    setSelectedUser(user);
-                                                    if (mapRef.current) {
-                                                        mapRef.current.panTo({ lat: user.lat, lng: user.lng });
-                                                        mapRef.current.setZoom(14);
-                                                    }
-                                                }}
-                                                className={`group flex items-center gap-3 p-2 rounded-xl cursor-pointer transition-all duration-300 ${selectedUser?.id === user.id ? 'bg-cyan-500/20 border border-cyan-500/30' : 'hover:bg-white/5 border border-transparent hover:border-white/10'}`}
-                                            >
-                                                <div className="relative shrink-0">
-                                                    <Avatar
-                                                        src={user.photoURL}
-                                                        alt={user.displayName}
-                                                        fallback={user.displayName?.[0]}
-                                                        className={`size-8 rounded-full border border-white/10 shadow-[0_0_10px_rgba(0,0,0,0.5)] transition-all ${isUserActive ? 'opacity-100' : 'opacity-40 grayscale'}`}
-                                                    />
-                                                    <div className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-black ${isUserActive ? 'bg-green-500 shadow-[0_0_5px_#22c55e]' : 'bg-gray-600'}`} />
-                                                </div>
-                                                <div className="min-w-0 flex-1">
-                                                    <div className="flex items-center justify-between gap-2">
-                                                        <span className={`text-[10px] font-black truncate uppercase tracking-wider ${isUserActive ? 'text-white' : 'text-gray-500'}`}>{user.displayName}</span>
-                                                        <span className={`shrink-0 text-[7px] font-black uppercase px-1 rounded ${isUserActive ? 'text-green-400 bg-green-500/10 border border-green-500/20' : 'text-gray-600 bg-gray-500/5'}`}>
-                                                            {isUserActive ? 'Active' : 'Offline'}
-                                                        </span>
-                                                    </div>
-                                                    <div className="flex items-center gap-2 mt-0.5">
-                                                        <span className="text-[8px] text-gray-500 font-bold uppercase truncate">{user.platform || 'Node'}</span>
-                                                        <div className="size-1 rounded-full bg-white/10" />
-                                                        <span className="text-[8px] text-gray-400 font-mono">{(user.lat || 0).toFixed(2)}, {(user.lng || 0).toFixed(2)}</span>
-                                                    </div>
-                                                </div>
-                                                <div className="opacity-0 group-hover:opacity-100 transition-opacity translate-x-1 group-hover:translate-x-0">
-                                                    <div className="size-4 flex items-center justify-center rounded-full bg-cyan-500/20 text-cyan-400 border border-cyan-500/30">
-                                                        <span className="text-[10px] font-black">⊕</span>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </div>
-                                    );
-                                }}
-                            />
-                        )}
-                    </div>
+                        ))
+                    )}
+                </div>
 
-                    <div className="p-3 border-t border-white/5 bg-white/5">
-                        <div className="flex items-center justify-between text-[7px] font-black text-gray-500 uppercase tracking-widest px-1">
-                            <span>Encrypted Link</span>
-                            <span className="text-cyan-500/50 animate-pulse">Tracking active</span>
-                        </div>
-                    </div>
+                {/* Footer Sync Time & Telemetry Status */}
+                <div className="p-3 border-t border-slate-800 text-[10px] text-slate-500 flex justify-between items-center shrink-0">
+                    <span className="flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                        Realtime GPS Feed
+                    </span>
+                    <span>{format(lastSync, 'HH:mm:ss')}</span>
                 </div>
             </div>
 
-            {/* Visual Effects - Conditional for battery saving */}
-            {!batterySaver && (
-                <>
-                    {/* Scanline Effect */}
-                    <div className="absolute inset-0 bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.1)_50%),linear-gradient(90deg,rgba(255,0,0,0.03),rgba(0,255,0,0.01),rgba(0,0,255,0.03))] bg-[size:100%_2px,3px_100%] z-30 pointer-events-none opacity-20" />
-                    {/* Vignette */}
-                    <div className="absolute inset-0 pointer-events-none z-20 shadow-[inset_0_0_150px_rgba(0,0,0,1)]" />
-                </>
+            {/* Floating Open Drawer Button (Shown when drawer is closed) */}
+            {!sidebarOpen && (
+                <button
+                    onClick={() => setSidebarOpen(true)}
+                    className="absolute top-3 left-3 z-[1000] px-3 py-1.5 bg-slate-900/90 hover:bg-slate-800 backdrop-blur-md text-cyan-400 border border-slate-800 rounded-xl transition-all shadow-xl flex items-center gap-2 text-xs font-semibold"
+                    title="Open tracked nodes list"
+                >
+                    <MapPin size={15} />
+                    <span>Tracked Nodes ({locations.length})</span>
+                </button>
+            )}
+
+            {/* MapmyIndia Key & License Settings Modal */}
+            {showKeyModal && (
+                <div className="fixed inset-0 z-[2000] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+                    <div
+                        className="relative w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden p-5 space-y-4 animate-in zoom-in-95 duration-200"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+                            <div className="flex items-center gap-2.5">
+                                <div className="p-2 rounded-xl bg-cyan-950 border border-cyan-500/40 text-cyan-400">
+                                    <Globe size={18} />
+                                </div>
+                                <div>
+                                    <h3 className="font-bold text-sm text-slate-100">MapmyIndia License & Key</h3>
+                                    <p className="text-[11px] text-slate-400">Manage geospatial radar provider credentials</p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={() => setShowKeyModal(false)}
+                                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+                            >
+                                <X size={18} />
+                            </button>
+                        </div>
+
+                        {/* Status Analysis Box */}
+                        <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
+                            <div className="flex justify-between text-xs">
+                                <span className="text-slate-400 font-medium">Configured Key:</span>
+                                <span className="font-mono text-cyan-300 text-[11px] truncate max-w-[200px]">{mmiKey || 'None'}</span>
+                            </div>
+                            <div className="flex justify-between text-xs">
+                                <span className="text-slate-400 font-medium">Server API Status:</span>
+                                <span className={`font-semibold ${
+                                    mmiTestStatus?.testing ? 'text-amber-400' :
+                                    mmiTestStatus?.valid ? 'text-emerald-400' : 'text-rose-400'
+                                }`}>
+                                    {mmiTestStatus?.testing ? 'Verifying...' :
+                                     mmiTestStatus?.valid ? '● Active & Valid' :
+                                     mmiTestStatus?.error ? `● ${mmiTestStatus.error}` : '● Expired / Unauthorized'}
+                                </span>
+                            </div>
+                            <div className="flex justify-between text-xs">
+                                <span className="text-slate-400 font-medium">Active Radar Fallback:</span>
+                                <span className="text-emerald-400 font-semibold">● Esri Dark Recon (Watermark-Free)</span>
+                            </div>
+                        </div>
+
+                        {/* Key Input */}
+                        <div className="space-y-1.5">
+                            <label className="text-xs font-semibold text-slate-300 flex items-center justify-between">
+                                <span>Update MapmyIndia / Mappls Key</span>
+                                <a
+                                    href="https://platform.mappls.com/"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-[10px] text-cyan-400 hover:underline flex items-center gap-1"
+                                >
+                                    <span>Get Key</span>
+                                    <ExternalLink size={10} />
+                                </a>
+                            </label>
+                            <input
+                                type="text"
+                                value={inputKey}
+                                onChange={(e) => setInputKey(e.target.value)}
+                                placeholder="Paste Mappls API key..."
+                                className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white font-mono focus:outline-none focus:ring-1 focus:ring-cyan-500"
+                            />
+                        </div>
+
+                        {/* Actions */}
+                        <div className="flex items-center justify-end gap-2 pt-2">
+                            <button
+                                onClick={() => testMapmyIndiaKey(inputKey)}
+                                disabled={mmiTestStatus?.testing}
+                                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5"
+                            >
+                                <RefreshCw size={13} className={mmiTestStatus?.testing ? 'animate-spin' : ''} />
+                                <span>Test Key</span>
+                            </button>
+                            <button
+                                onClick={() => {
+                                    handleSaveKey();
+                                    setShowKeyModal(false);
+                                }}
+                                className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-xl text-xs font-semibold transition-colors flex items-center gap-1.5 shadow-sm"
+                            >
+                                <Check size={14} />
+                                <span>Save & Activate</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
             )}
         </div>
     );

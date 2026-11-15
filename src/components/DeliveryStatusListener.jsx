@@ -1,99 +1,78 @@
-import { useEffect, useRef } from 'react';
+import React, { useEffect, useRef } from 'react';
+import { supabase } from '../supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { subscribeToUserChats } from '../services/chatListService';
-import { db } from '../firebase';
-import { collection, query, where, getDocs, writeBatch } from 'firebase/firestore';
 
-const DeliveryStatusListener = () => {
+export default function DeliveryStatusListener() {
     const { currentUser } = useAuth();
-    const lastCheckedTimestamps = useRef({});
+    const userId = currentUser?.uid || currentUser?.id;
+    const convIdsRef = useRef(new Set());
 
     useEffect(() => {
-        if (!currentUser?.uid) return;
+        if (!userId) return;
 
-        // Subscribe to chat list changes
-        const unsubscribe = subscribeToUserChats(currentUser.uid, async (chats) => {
-            // Update Document Title (WhatsApp-like badge)
-            const totalUnread = chats.reduce((acc, chat) => {
-                return acc + (chat.unreadCount?.[currentUser.uid] || 0);
-            }, 0);
-            document.title = totalUnread > 0 ? `(${totalUnread}) Nova` : 'Nova';
+        let channel = null;
 
-            // Filter chats that have unread messages for the current user
-            const chatsWithUnread = chats.filter(chat => {
-                const unread = chat.unreadCount?.[currentUser.uid];
-                return unread && unread > 0;
-            });
+        const setupDeliveryTracking = async () => {
+            try {
+                // 1. Fetch user's active conversations
+                const { data: parts } = await supabase
+                    .from('conversation_participants')
+                    .select('conversation_id')
+                    .eq('user_id', userId);
 
-            if (chatsWithUnread.length === 0) return;
+                const convIds = (parts || []).map(p => p.conversation_id);
+                convIdsRef.current = new Set(convIds);
 
-            // PERFORMANCE NOTE: We previously skipped this if tab was hidden.
-            // But for 100/100 robustness, the listener acts as a reliable fallback to the SW.
-            // Firestore's offline persistence handles the efficiency.
+                if (convIds.length === 0) return;
 
-            // Smart Diff: Only process chats that have a newer message than last checked
-            const chatsToProcess = chatsWithUnread.filter(chat => {
-                const lastTimestamp = lastCheckedTimestamps.current[chat.id];
-                // Handle Firestore Timestamp or Date object
-                const currentTimestamp = chat.lastMessageTimestamp?.toMillis?.() || chat.lastMessageTimestamp?.getTime?.() || 0;
+                // 2. Initial delivery reconciliation: Mark un-delivered incoming messages as delivered
+                await supabase
+                    .from('messages')
+                    .update({
+                        status: 'delivered',
+                        delivered_at: new Date().toISOString()
+                    })
+                    .in('conversation_id', convIds)
+                    .neq('sender_id', userId)
+                    .eq('status', 'sent');
 
-                if (currentTimestamp > (lastTimestamp || 0)) {
-                    lastCheckedTimestamps.current[chat.id] = currentTimestamp;
-                    return true;
-                }
-                return false;
-            });
-
-            if (chatsToProcess.length === 0) return;
-
-            // console.log(`[DeliveryListener] Processing ${chatsToProcess.length} chats with new unread messages...`);
-
-            // For each chat with *new* unread messages, find undelivered ones and mark as delivered
-            for (const chat of chatsToProcess) {
-                try {
-                    const messagesRef = collection(db, 'chats', chat.id, 'messages');
-                    const qUndelivered = query(
-                        messagesRef,
-                        where('delivered', '==', false),
-                        where('senderId', '!=', currentUser.uid)
-                    );
-
-                    const snapshot = await getDocs(qUndelivered).catch(e => {
-                        console.warn(`[DeliveryListener] Skipping chat ${chat.id}:`, e.message);
-                        return { empty: true };
-                    });
-
-                    if (snapshot.empty) continue;
-
-                    // Group writes into batches of 500 (Firestore limit)
-                    const chunks = [];
-                    for (let i = 0; i < snapshot.docs.length; i += 500) {
-                        chunks.push(snapshot.docs.slice(i, i + 500));
-                    }
-
-                    for (const chunk of chunks) {
-                        const batch = writeBatch(db);
-                        chunk.forEach(docSnap => {
-                            batch.update(docSnap.ref, { delivered: true });
-                        });
-                        await batch.commit();
-                    }
-
-                    // console.log(`[DeliveryListener] Marked ${snapshot.docs.length} messages as delivered in chat ${chat.id}`);
-
-                    // Tiny delay to avoid hitting Firebase write-heavy rate limits
-                    await new Promise(r => setTimeout(r, 100));
-
-                } catch (error) {
-                    console.error(`[DeliveryListener] Error in chat ${chat.id}:`, error);
-                }
+                // 3. Listen to incoming messages in real-time to acknowledge immediate delivery
+                channel = supabase
+                    .channel(`user_delivery_${userId}`)
+                    .on(
+                        'postgres_changes',
+                        {
+                            event: 'INSERT',
+                            schema: 'public',
+                            table: 'messages'
+                        },
+                        async (payload) => {
+                            const newMsg = payload.new;
+                            if (newMsg.sender_id !== userId && convIdsRef.current.has(newMsg.conversation_id)) {
+                                if (newMsg.status === 'sent') {
+                                    await supabase
+                                        .from('messages')
+                                        .update({
+                                            status: 'delivered',
+                                            delivered_at: new Date().toISOString()
+                                        })
+                                        .eq('id', newMsg.id);
+                                }
+                            }
+                        }
+                    )
+                    .subscribe();
+            } catch (err) {
+                console.debug('[DeliveryStatusListener] Setup error:', err);
             }
-        }, 30, 'DeliveryStatusListener');
+        };
 
-        return () => unsubscribe();
-    }, [currentUser?.uid]);
+        setupDeliveryTracking();
 
-    return null; // This component renders nothing
-};
+        return () => {
+            if (channel) supabase.removeChannel(channel);
+        };
+    }, [userId]);
 
-export default DeliveryStatusListener;
+    return null;
+}

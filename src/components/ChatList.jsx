@@ -1,7 +1,6 @@
 import React, { useEffect, useState, useMemo } from "react";
 import { ChatListSkeleton } from "./ui/Skeleton";
 import ChatListItem from "./ChatListItem";
-import { db } from "../firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { Avatar } from "./ui/Avatar";
 import { Link } from "react-router-dom";

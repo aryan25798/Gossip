@@ -17,6 +17,8 @@ dist-ssr
 functions/.env
 public/firebase-messaging-sw.js
 src/firebase-messaging-sw.js
+scratch/
+server/
 
 
 # Editor directories and files

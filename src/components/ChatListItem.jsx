@@ -4,7 +4,6 @@ import { cn } from "../lib/utils";
 import { format } from "date-fns";
 import { Link, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
-import { repairChatMetadata } from "../services/chatService";
 
 const ChatListItem = memo(({ chat, currentUserId }) => {
     const { id } = useParams();
@@ -25,12 +24,7 @@ const ChatListItem = memo(({ chat, currentUserId }) => {
         displayInfo.photo = userInfo?.photoURL;
         displayInfo.id = otherUserId || chat.id;
 
-        // Self-Repair: If name is "User" or missing, try to fetch fresh metadata
-        if ((!userInfo || !userInfo.displayName || userInfo.displayName === "User") && !repairAttemptedRef.current) {
-            repairAttemptedRef.current = true;
-            // Fire and forget repair
-            repairChatMetadata(chat.id, currentUserId);
-        }
+
     }
 
     const isActive = id === chat.id; // Match against chat ID for the list

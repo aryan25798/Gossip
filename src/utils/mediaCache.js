@@ -27,7 +27,7 @@ const memoryCache = new Map(); // Synchronous cache for current session
 /**
  * Tries to get a blob URL from cache. If not found, returns null.
  * IMPORTANT: Call revokeMediaURL() when the URL is no longer needed to prevent memory leaks.
- * @param {string} url - The Firebase Storage URL
+ * @param {string} url - The Storage URL
  * @returns {Promise<string|null>} - The object URL or null
  */
 /**

@@ -1,362 +1,45 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import UserRegistry from '../components/admin/UserRegistry';
-import UserDossier from '../components/admin/UserDossier'; // Import UserDossier
-import GodMap from '../components/admin/GodMap';
-import SpyChatViewer from '../components/admin/SpyChatViewer';
 import AdminOverview from '../components/admin/AdminOverview';
+import UserRegistry from '../components/admin/UserRegistry';
+import UserDossier from '../components/admin/UserDossier';
 import ModerationQueue from '../components/admin/ModerationQueue';
-import Announcements from '../components/admin/Announcements'; // Import New Component
-import { db, auth, functions } from '../firebase';
-import { collection, query, orderBy, limit, getDocs, where, doc, updateDoc, startAt, endAt } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
-import { format } from 'date-fns';
-import { LogOut, LayoutDashboard, Users, Map, Eye, ShieldAlert, Megaphone, Menu, X, Search } from 'lucide-react';
+import ConversationModeration from '../components/admin/ConversationModeration';
+import Announcements from '../components/admin/Announcements';
+import GodMap from '../components/admin/GodMap';
+import AdminAuditLogs from '../components/admin/AdminAuditLogs';
 import { Avatar } from '../components/ui/Avatar';
+import {
+    LayoutDashboard, Users, ShieldAlert, MessageSquare, Megaphone,
+    MapPin, FileText, LogOut, Menu, X, ChevronRight, MessageCircle,
+    PanelLeftClose, PanelLeftOpen
+} from 'lucide-react';
 
-// Helper for debouncing
-function useDebounce(value, delay) {
-    const [debouncedValue, setDebouncedValue] = useState(value);
-    useEffect(() => {
-        const handler = setTimeout(() => {
-            setDebouncedValue(value);
-        }, delay);
-        return () => {
-            clearTimeout(handler);
-        };
-    }, [value, delay]);
-    return debouncedValue;
-}
-
-// Sub-component for chat selection in Spy Mode (Refactored for User-Centric Intelligence)
-const ChatSelector = ({ onSelectChat, onSwitchToRegistry, activeChatId, participants, setParticipants }) => {
-    const [groupedUsers, setGroupedUsers] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [searchLoading, setSearchLoading] = useState(false);
-    const [error, setError] = useState(null);
-    const [searchTerm, setSearchTerm] = useState('');
-    const debouncedSearchTerm = useDebounce(searchTerm, 600);
-    const [chatLimit, setChatLimit] = useState(50);
-    const [hasMoreChats, setHasMoreChats] = useState(true);
-    const [expandedUser, setExpandedUser] = useState(null);
-
-    // Initial Load (Recent Activity)
-    const loadIntel = async () => {
-
-        setLoading(true);
-        setError(null);
-        try {
-            // 1. Fetch recent active chats
-            const q = query(collection(db, 'chats'), orderBy('lastMessageTimestamp', 'desc'), limit(chatLimit));
-            const snap = await getDocs(q);
-            const chatList = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-            await processChatsAndGroup(chatList);
-            setHasMoreChats(snap.docs.length >= chatLimit);
-        } catch (err) {
-            console.error("Spy Intel Load Error:", err);
-            setError(err.code === 'permission-denied' ? 'PERMISSION_DENIED' : 'SYSTEM_FAILURE');
-        } finally {
-            setLoading(false);
-        }
-    };
-
-    // Shared processor for chat list -> grouped UI
-    const processChatsAndGroup = async (chatList) => {
-        const uids = [...new Set(chatList.flatMap(c => c.participants || []))];
-        const pMap = { ...participants }; // Keep existing cache
-
-        // Fetch missing profiles
-        const missingUids = uids.filter(uid => !pMap[uid]);
-        if (missingUids.length > 0) {
-            for (let i = 0; i < missingUids.length; i += 10) {
-                const batch = missingUids.slice(i, i + 10);
-                const uQuery = query(collection(db, 'users'), where('__name__', 'in', batch));
-                const uSnap = await getDocs(uQuery);
-                uSnap.docs.forEach(doc => {
-                    pMap[doc.id] = doc.data();
-                });
-            }
-        }
-        setParticipants(pMap);
-
-        // Group chats under Users
-        const userGroups = {};
-        chatList.forEach(chat => {
-            const realParticipants = chat.participants?.filter(uid => uid && uid !== auth.currentUser?.uid) || [];
-            realParticipants.forEach(uid => {
-                if (!userGroups[uid]) {
-                    userGroups[uid] = {
-                        profile: pMap[uid] || { uid, displayName: 'Anonymous' },
-                        chats: [],
-                        latestActivity: chat.lastMessage?.timestamp
-                    };
-                }
-                userGroups[uid].chats.push(chat);
-                // Keep track of the absolute latest activity for this user
-                if (chat.lastMessage?.timestamp > (userGroups[uid].latestActivity || 0)) {
-                    userGroups[uid].latestActivity = chat.lastMessage.timestamp;
-                }
-            });
-        });
-
-        const sortedUsers = Object.values(userGroups).sort((a, b) =>
-            (b.latestActivity?.toMillis?.() || 0) - (a.latestActivity?.toMillis?.() || 0)
-        );
-        setGroupedUsers(sortedUsers);
-    };
-
-    // Search Logic
-    useEffect(() => {
-        if (!debouncedSearchTerm) {
-            if (groupedUsers.length === 0) loadIntel(); // Reload default if cleared
-            return;
-        }
-
-        const runSearch = async () => {
-            setSearchLoading(true);
-            try {
-                // 1. Search Users by DisplayName (Prefix)
-                // Note: Firestore requires specific index for this, or simple >= + <= logic
-                const usersRef = collection(db, 'users');
-                const end = debouncedSearchTerm + '\uf8ff';
-                const uQuery = query(
-                    usersRef,
-                    where('displayName', '>=', debouncedSearchTerm),
-                    where('displayName', '<=', end),
-                    limit(5)
-                );
-                const userSnap = await getDocs(uQuery);
-
-                if (userSnap.empty) {
-                    setGroupedUsers([]);
-                    setSearchLoading(false);
-                    return;
-                }
-
-                const foundUids = userSnap.docs.map(d => d.id);
-
-                // 2. Find Chats for these users
-                // array-contains-any is capped at 10, which matches our user limit
-                const cQuery = query(
-                    collection(db, 'chats'),
-                    where('participants', 'array-contains-any', foundUids),
-                    orderBy('lastMessageTimestamp', 'desc'),
-                    limit(20)
-                );
-                const chatSnap = await getDocs(cQuery);
-                const chatList = chatSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-
-                await processChatsAndGroup(chatList);
-            } catch (err) {
-                console.error("Search failed:", err);
-                // Fallback to name match in existing loaded data if server index fails
-            } finally {
-                setSearchLoading(false);
-            }
-        };
-
-        runSearch();
-    }, [debouncedSearchTerm]);
-
-    // Initial Load
-    useEffect(() => { loadIntel(); }, [chatLimit]);
-
-    const loadMoreIntel = () => setChatLimit(prev => prev + 50);
-
-    return (
-        <div className="h-full bg-white dark:bg-[#1f2937] border-r border-gray-200 dark:border-gray-700 flex flex-col shadow-sm">
-            <div className="p-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-[#111827]">
-                <div className="flex justify-between items-center mb-4">
-                    <div>
-                        <h3 className="text-gray-900 dark:text-white font-bold text-sm tracking-tight uppercase">Intelligence Feed</h3>
-                        <p className="text-[10px] text-gray-500 font-bold uppercase tracking-tighter opacity-60">
-                            {searchTerm ? 'Search Results' : 'Grouped by active users'}
-                        </p>
-                    </div>
-                    {searchLoading ? (
-                        <div className="w-2 h-2 rounded-full bg-yellow-500 animate-ping" />
-                    ) : (
-                        <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
-                    )}
-                </div>
-
-                <div className="relative">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={14} />
-                    <input
-                        type="text"
-                        placeholder="Search users (Server-Side)..."
-                        value={searchTerm}
-                        onChange={(e) => setSearchTerm(e.target.value)}
-                        className="w-full pl-9 pr-4 py-2 bg-white dark:bg-[#1f2937] border border-gray-200 dark:border-gray-800 rounded-xl text-xs focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm"
-                    />
-                </div>
-            </div>
-
-            <div className="flex-1 overflow-y-auto custom-scrollbar">
-                {loading || searchLoading ? (
-                    <div className="p-4 space-y-4">
-                        {[1, 2, 3].map(i => (
-                            <div key={i} className="space-y-2">
-                                <div className="h-14 bg-gray-100 dark:bg-gray-800 animate-pulse rounded-xl" />
-                                <div className="h-4 w-2/3 ml-4 bg-gray-50 dark:bg-gray-800/50 animate-pulse rounded" />
-                            </div>
-                        ))}
-                    </div>
-                ) : error === 'PERMISSION_DENIED' ? (
-                    <div className="h-full flex flex-col items-center justify-center p-8 text-center space-y-4">
-                        <div className="w-12 h-12 rounded-full bg-red-100 flex items-center justify-center text-red-600">⚠️</div>
-                        <div>
-                            <h4 className="text-gray-900 dark:text-white font-bold text-sm text-red-500">Access Restricted</h4>
-                            <p className="text-xs text-gray-500 mt-1">High-level clearance required</p>
-                        </div>
-                        <button
-                            key="sync-btn"
-                            onClick={async () => {
-                                try {
-                                    const syncFn = httpsCallable(functions, 'syncAdminClaims');
-                                    await syncFn();
-                                    await auth.currentUser?.getIdToken(true); // Force refresh
-                                    alert("Permissions Synced. Reloading feed...");
-                                    loadIntel();
-                                } catch (e) {
-                                    alert("Sync Failed: " + e.message);
-                                }
-                            }}
-                            className="px-4 py-2 bg-indigo-600 text-white text-xs font-semibold rounded-lg hover:bg-indigo-700 transition-colors shadow-sm"
-                        >
-                            Sync Permissions
-                        </button>
-                    </div>
-                ) : groupedUsers.length === 0 ? (
-                    <div className="p-8 text-center space-y-4">
-                        <p className="text-gray-400 text-xs">No targets found.</p>
-                        <button
-                            onClick={loadIntel}
-                            className="text-[10px] font-bold text-indigo-500 uppercase hover:underline"
-                        >
-                            Refresh Feed
-                        </button>
-                    </div>
-                ) : (
-                    <div key="intel-list-container">
-                        {groupedUsers.map((group, index) => (
-                            <div key={`user-group-${group.profile.uid || index}`} className="border-b border-gray-100 dark:border-gray-800">
-                                {/* User Accordion Trigger */}
-                                <div
-                                    onClick={() => setExpandedUser(expandedUser === group.profile.uid ? null : group.profile.uid)}
-                                    className={`p-4 hover:bg-gray-50 dark:hover:bg-gray-800/50 cursor-pointer transition-all flex items-center gap-3 ${expandedUser === group.profile.uid ? 'bg-indigo-50/50 dark:bg-indigo-900/10' : ''}`}
-                                >
-                                    <div className="relative">
-                                        <Avatar
-                                            src={group.profile.photoURL}
-                                            alt={group.profile.displayName}
-                                            fallback={group.profile.displayName?.[0]}
-                                            className="w-10 h-10 rounded-xl border border-gray-200 dark:border-gray-700"
-                                        />
-                                        {group.profile.isOnline && (
-                                            <div className="absolute -bottom-1 -right-1 w-3 h-3 bg-green-500 rounded-full border-2 border-white dark:border-[#1f2937]" />
-                                        )}
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                        <h4 className="text-sm font-bold text-gray-900 dark:text-white truncate">
-                                            {group.profile.displayName || 'Anonymous'}
-                                        </h4>
-                                        <p className="text-[10px] text-gray-500 dark:text-gray-400 font-medium uppercase tracking-tighter">
-                                            {group.chats.length} Active Stream(s)
-                                        </p>
-                                    </div>
-                                    <div className={`transition-transform duration-300 ${expandedUser === group.profile.uid ? 'rotate-180' : ''}`}>
-                                        <Menu size={14} className="text-gray-400" />
-                                    </div>
-                                </div>
-
-                                {/* Expanded Chats */}
-                                {expandedUser === group.profile.uid && (
-                                    <div className="bg-gray-50/50 dark:bg-gray-900/20 py-1 slide-down overflow-hidden">
-                                        {group.chats.map(chat => {
-                                            const otherParticipants = chat.participants?.filter(uid => uid !== group.profile.uid && uid !== auth.currentUser?.uid) || [];
-                                            const otherUser = participants[otherParticipants[0]] || { displayName: 'Multiple' };
-
-                                            return (
-                                                <div
-                                                    key={chat.id}
-                                                    onClick={() => onSelectChat(chat.id)}
-                                                    className={`pl-14 pr-4 py-3 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 cursor-pointer border-l-4 transition-all ${activeChatId === chat.id ? 'border-l-indigo-500 bg-indigo-50 dark:bg-indigo-900/30' : 'border-l-transparent'}`}
-                                                >
-                                                    <div className="flex justify-between items-start mb-0.5">
-                                                        <span className="text-[11px] font-bold text-gray-700 dark:text-gray-300 truncate">
-                                                            {chat.type === 'group' ? `Group: ${chat.groupName}` : `With: ${otherUser.displayName || 'Anonymous'}`}
-                                                        </span>
-                                                        <span className="text-[9px] font-bold text-gray-400">
-                                                            {chat.lastMessage?.timestamp?.toDate ? format(chat.lastMessage.timestamp.toDate(), 'HH:mm') : 'Active'}
-                                                        </span>
-                                                    </div>
-                                                    <p className="text-[10px] text-gray-500 truncate opacity-80">
-                                                        {chat.lastMessage?.text || 'Empty secure line'}
-                                                    </p>
-                                                    <div className="mt-1 flex items-center gap-2">
-                                                        <span className="text-[8px] font-mono font-black text-indigo-500 uppercase tracking-tighter bg-indigo-50 dark:bg-indigo-900/40 px-1 rounded">
-                                                            ID: {chat.id.slice(0, 8)}
-                                                        </span>
-                                                    </div>
-                                                </div>
-                                            );
-                                        })}
-                                    </div>
-                                )}
-                            </div>
-                        ))}
-                    </div>
-                )}
-
-                {hasMoreChats && !searchTerm && !loading && (
-                    <div key="load-more-intel" className="p-4 border-t border-gray-100 dark:border-gray-800 bg-gray-50/30 dark:bg-gray-900/10">
-                        <button
-                            onClick={loadMoreIntel}
-                            className="w-full py-2 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 text-[10px] font-bold uppercase rounded-lg hover:bg-indigo-100 transition-all border border-indigo-100 dark:border-indigo-900/50"
-                        >
-                            Load More Intel
-                        </button>
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-};
-
-
-const AdminDashboard = () => {
+export const AdminDashboard = () => {
     const [searchParams, setSearchParams] = useSearchParams();
     const activeTab = searchParams.get('tab') || 'overview';
-    const spyChatId = searchParams.get('chat');
     const [selectedUserDossier, setSelectedUserDossier] = useState(null);
-    const [participants, setParticipants] = useState({}); // Global profile cache for Admin
-    const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+    const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
     const navigate = useNavigate();
     const { logout, currentUser } = useAuth();
 
-    // FAIL-SAFE: If a normal user somehow enters Admin Dashboard, kick them to chat
+    // Security Gate Check
     useEffect(() => {
-        if (currentUser && currentUser.claimsSettled) {
-            const isAdmin = !!currentUser.isAdmin || !!currentUser.superAdmin;
+        if (currentUser) {
+            const isAdmin = currentUser.role === 'admin' || currentUser.role === 'superAdmin' || !!currentUser.isAdmin;
             if (!isAdmin) {
-                console.error("[Security] Non-Admin in Admin Portal. Access Revoked.");
-                navigate("/", { replace: true });
+                console.warn('[AdminSecurity] Non-administrative identity detected. Access terminated.');
+                navigate('/', { replace: true });
             }
         }
     }, [currentUser, navigate]);
 
     const setActiveTab = (tab) => {
         setSearchParams({ tab });
-        setIsSidebarOpen(false);
-    };
-
-    const setSpyChatId = (chatId) => {
-        const params = { tab: 'spy' };
-        if (chatId) params.chat = chatId;
-        setSearchParams(params);
+        setIsMobileMenuOpen(false);
     };
 
     const handleLogout = async () => {
@@ -368,218 +51,216 @@ const AdminDashboard = () => {
         }
     };
 
-    const handleBan = async (uid, currentStatus) => {
-        if (!window.confirm(`Are you sure you want to ${currentStatus ? 'Unban' : 'Ban'} this user?`)) return;
-        try {
-            const banFn = httpsCallable(functions, 'banUser');
-            await banFn({ targetUid: uid, isBanned: !currentStatus });
-
-            if (selectedUserDossier && selectedUserDossier.id === uid) {
-                setSelectedUserDossier(prev => ({ ...prev, isBanned: !currentStatus }));
-            }
-            alert(`User ${currentStatus ? 'Unbanned' : 'Banned'} successfully.`);
-        } catch (error) {
-            console.error("Action failed:", error);
-            alert("Error: " + error.message);
-        }
-    };
-
-    const handleNuke = async (uid) => {
-        const confirmWord = prompt("DANGER: This will permanently delete ALL user data. Type 'PURGE' to confirm for ID: " + uid);
-        if (confirmWord !== 'PURGE') return;
-
-        try {
-            const nukeFn = httpsCallable(functions, 'nukeUser');
-            await nukeFn({ targetUid: uid });
-            alert("Success: User Nuked.");
-            if (selectedUserDossier && selectedUserDossier.id === uid) {
-                setSelectedUserDossier(null);
-            }
-        } catch (error) {
-            console.error("Purge failed:", error);
-            alert("Failed: " + error.message);
-        }
-    };
-
-    const tabs = [
+    const navItems = [
         { id: 'overview', label: 'Command Center', icon: LayoutDashboard },
         { id: 'registry', label: 'User Registry', icon: Users },
         { id: 'moderation', label: 'Moderation Queue', icon: ShieldAlert },
-        { id: 'announcements', label: 'Megaphone', icon: Megaphone },
-        { id: 'spy', label: 'Spy Mode', icon: Eye },
-        { id: 'map', label: 'Marauder Map', icon: Map },
+        { id: 'conversations', label: 'Conversations', icon: MessageSquare },
+        { id: 'announcements', label: 'Megaphone Alerts', icon: Megaphone },
+        { id: 'locations', label: 'Location Radar', icon: MapPin },
+        { id: 'audit', label: 'Audit Trail', icon: FileText },
     ];
 
-    return (
-        <div className="flex h-screen w-full bg-[#f9fafb] dark:bg-[#0b0f1a] text-gray-900 dark:text-[#f3f4f6] font-sans overflow-hidden select-none">
-            {/* Mobile Header */}
-            <div className="lg:hidden absolute top-0 left-0 right-0 h-16 bg-white/80 dark:bg-[#1f2937]/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800 z-[50] flex items-center px-4 justify-between">
-                <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-600 to-purple-600 flex items-center justify-center text-white font-bold italic">N</div>
-                    <h1 className="font-bold text-lg bg-clip-text text-transparent bg-gradient-to-r from-indigo-600 to-purple-600">Admin</h1>
-                </div>
-                <button
-                    onClick={() => setIsSidebarOpen(true)}
-                    className="p-2 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors text-gray-600 dark:text-gray-400"
-                >
-                    <Menu size={24} />
-                </button>
-            </div>
+    const currentTabObj = navItems.find(item => item.id === activeTab) || navItems[0];
 
-            {/* Sidebar Overlay (Mobile) */}
-            {isSidebarOpen && (
+    return (
+        <div className="flex h-screen w-full bg-slate-100 dark:bg-slate-950 text-slate-900 dark:text-slate-100 font-sans overflow-hidden select-none">
+            {/* Mobile Drawer Backdrop */}
+            {isMobileMenuOpen && (
                 <div
-                    onClick={() => setIsSidebarOpen(false)}
-                    className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] lg:hidden animate-in fade-in duration-300"
+                    className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm lg:hidden animate-in fade-in duration-200"
+                    onClick={() => setIsMobileMenuOpen(false)}
                 />
             )}
 
-            {/* Sidebar */}
-            <aside className={`
-                fixed lg:static inset-y-0 left-0 w-[280px] bg-white dark:bg-[#111827] border-r border-gray-200 dark:border-gray-800 z-[70] transform transition-transform duration-300 ease-out flex flex-col flex-shrink-0
-                ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
-            `}>
-                <div className="h-20 flex items-center px-6 w-full border-b border-gray-100 dark:border-gray-800/50 justify-between flex-shrink-0">
-                    <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-indigo-600 to-purple-600 flex items-center justify-center text-white font-black italic shadow-lg shadow-indigo-500/20">N</div>
-                        <div>
-                            <h1 className="font-extrabold text-xl tracking-tight text-gray-900 dark:text-white">NOVA</h1>
-                            <div className="flex items-center gap-1.5 mt-0.5">
-                                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                                <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest">System Online</span>
-                            </div>
+            {/* Sidebar Navigation */}
+            <aside
+                className={`
+                    fixed lg:static inset-y-0 left-0 z-50 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col shrink-0 transition-all duration-300 ease-in-out overflow-hidden
+                    ${isSidebarCollapsed ? 'lg:w-20' : 'lg:w-64'}
+                    w-72 max-w-[85vw]
+                    ${isMobileMenuOpen ? 'translate-x-0 shadow-2xl' : '-translate-x-full lg:translate-x-0'}
+                `}
+            >
+                {/* Brand / Logo */}
+                <div className="h-16 px-4 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between shrink-0 overflow-hidden">
+                    <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                        <div className="w-9 h-9 rounded-xl bg-indigo-600 flex items-center justify-center text-white font-black text-base shadow-sm shrink-0">
+                            N
+                        </div>
+                        {/* Title: In desktop collapsed mode, hide text completely; always show in mobile drawer */}
+                        <div className={`min-w-0 ${isSidebarCollapsed ? 'hidden lg:hidden' : 'block'}`}>
+                            <h1 className="font-bold text-sm tracking-tight text-slate-900 dark:text-slate-100 leading-none truncate">
+                                NovaChat
+                            </h1>
+                            <span className="text-[10px] text-slate-500 font-medium tracking-wide block mt-1 truncate">
+                                Enterprise Portal
+                            </span>
                         </div>
                     </div>
+
                     <button
-                        onClick={() => setIsSidebarOpen(false)}
-                        className="lg:hidden p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-400"
+                        onClick={() => setIsMobileMenuOpen(false)}
+                        className="lg:hidden p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 shrink-0"
+                        title="Close menu"
                     >
-                        <X size={20} />
+                        <X size={18} />
                     </button>
                 </div>
 
-                <nav className="flex-1 w-full p-4 space-y-1.5 mt-4 overflow-y-auto custom-scrollbar">
-                    <div className="px-3 mb-4 text-[11px] font-bold text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] flex items-center gap-2">
-                        <div className="h-px bg-gray-200 dark:bg-gray-800 flex-1" />
-                        Management
-                        <div className="h-px bg-gray-200 dark:bg-gray-800 flex-1" />
+                {/* Navigation Items */}
+                <nav className="flex-1 p-2.5 space-y-1 overflow-y-auto custom-scrollbar overflow-x-hidden">
+                    <div className={`px-3 py-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider truncate ${isSidebarCollapsed ? 'hidden lg:hidden' : 'block'}`}>
+                        System Management
                     </div>
-                    {tabs.map((tab) => {
-                        const Icon = tab.icon;
-                        const isActive = activeTab === tab.id;
+
+                    {navItems.map((item) => {
+                        const Icon = item.icon;
+                        const isActive = activeTab === item.id;
                         return (
                             <button
-                                key={tab.id}
-                                onClick={() => setActiveTab(tab.id)}
+                                key={item.id}
+                                onClick={() => setActiveTab(item.id)}
+                                title={item.label}
                                 className={`
-                                    w-full p-3.5 rounded-xl flex items-center transition-all duration-200 group active:scale-95
+                                    w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-xs font-semibold transition-all group overflow-hidden
                                     ${isActive
-                                        ? 'bg-gradient-to-r from-indigo-600 to-indigo-700 text-white shadow-xl shadow-indigo-500/20 z-10'
-                                        : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800/50 hover:text-gray-900 dark:hover:text-white'
+                                        ? 'bg-indigo-600 text-white shadow-sm'
+                                        : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/60 hover:text-slate-900 dark:hover:text-slate-100'
                                     }
+                                    ${isSidebarCollapsed ? 'lg:justify-center lg:px-0' : ''}
                                 `}
                             >
-                                <Icon size={20} className={`flex-shrink-0 transition-transform group-hover:scale-110 ${isActive ? 'text-white' : 'text-gray-400 dark:text-gray-500'}`} />
-                                <span className="ml-3.5 text-sm font-semibold tracking-wide">{tab.label}</span>
-                                {isActive && (
-                                    <div className="ml-auto w-1.5 h-6 rounded-full bg-white/40" />
-                                )}
+                                <Icon size={18} className={`shrink-0 ${isActive ? 'text-white' : 'text-slate-500 group-hover:text-slate-800 dark:group-hover:text-slate-200'}`} />
+                                <span className={`truncate ${isSidebarCollapsed ? 'lg:hidden' : 'inline'}`}>
+                                    {item.label}
+                                </span>
                             </button>
                         );
                     })}
                 </nav>
 
-                <div className="p-4 w-full border-t border-gray-100 dark:border-gray-800 flex-shrink-0 bg-gray-50/30 dark:bg-gray-800/10">
+                {/* Sidebar Footer: App Switcher & Logout */}
+                <div className="p-2.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50 shrink-0 space-y-1 overflow-hidden">
+                    <button
+                        onClick={() => navigate('/chat')}
+                        className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-200/60 dark:hover:bg-slate-800 transition-colors overflow-hidden ${
+                            isSidebarCollapsed ? 'lg:justify-center lg:px-0' : ''
+                        }`}
+                        title="Open NovaChat Messenger"
+                    >
+                        <MessageCircle size={16} className="text-emerald-500 shrink-0" />
+                        <span className={`truncate ${isSidebarCollapsed ? 'lg:hidden' : 'inline'}`}>Open User Chat</span>
+                    </button>
+
                     <button
                         onClick={handleLogout}
-                        className="w-full flex items-center justify-center px-4 py-3.5 rounded-xl text-red-600 dark:text-red-400 bg-red-50/50 dark:bg-red-900/10 hover:bg-red-100 dark:hover:bg-red-900/20 transition-all font-bold text-sm shadow-sm group"
+                        className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-xs font-semibold text-rose-600 dark:text-rose-400 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors overflow-hidden ${
+                            isSidebarCollapsed ? 'lg:justify-center lg:px-0' : ''
+                        }`}
+                        title="Sign Out"
                     >
-                        <LogOut size={18} className="mr-2.5 transition-transform group-hover:-translate-x-1" />
-                        Terminate Session
+                        <LogOut size={16} className="shrink-0" />
+                        <span className={`truncate ${isSidebarCollapsed ? 'lg:hidden' : 'inline'}`}>Sign Out</span>
                     </button>
                 </div>
             </aside>
 
             {/* Main Content Area */}
-            <main className="flex-1 flex flex-col relative overflow-hidden pt-16 lg:pt-0 w-full animate-in fade-in slide-in-from-right-2 duration-500">
-                <div className="flex-1 relative z-0 h-full w-full overflow-hidden flex flex-col">
-                    {/* Viewport Header (Desktop only tooltips/context) */}
-                    <div className="hidden lg:flex h-16 px-8 items-center justify-between border-b border-gray-100 dark:border-gray-800/50 backdrop-blur-md bg-white/30 dark:bg-transparent">
-                        <h2 className="text-sm font-bold text-gray-500 uppercase tracking-widest flex items-center gap-3">
-                            {tabs.find(t => t.id === activeTab)?.label}
-                            <span className="w-1 h-1 rounded-full bg-gray-300 dark:bg-gray-700" />
-                            <span className="text-[10px] lowercase font-normal italic">admin.novachat.io</span>
-                        </h2>
-                        <div className="flex items-center gap-4">
-                            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 text-xs font-bold ring-1 ring-indigo-200/50 dark:ring-transparent">
-                                <div className="w-1.5 h-1.5 rounded-full bg-indigo-600 dark:bg-indigo-400 animate-ping" />
-                                Live Feed
+            <div className="flex-1 flex flex-col h-full overflow-hidden min-w-0">
+                {/* Top Enterprise Header Bar */}
+                <header className="h-16 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 px-3 sm:px-4 md:px-6 flex items-center justify-between shrink-0 overflow-hidden w-full">
+                    {/* Left side: Mobile menu toggle, collapse toggle, breadcrumb / title */}
+                    <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+                        {/* Mobile Drawer Trigger (Visible < lg) */}
+                        <button
+                            onClick={() => setIsMobileMenuOpen(true)}
+                            className="lg:hidden p-2 rounded-xl text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                            title="Open navigation drawer"
+                        >
+                            <Menu size={20} />
+                        </button>
+
+                        {/* Desktop Sidebar Collapse Toggle (Visible >= lg) */}
+                        <button
+                            onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
+                            className="hidden lg:flex p-2 rounded-xl text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors shrink-0"
+                            title={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                        >
+                            {isSidebarCollapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}
+                        </button>
+
+                        {/* Breadcrumbs (Desktop & Tablet) */}
+                        <div className="hidden md:flex items-center gap-2 text-xs font-medium text-slate-500 min-w-0 truncate">
+                            <span className="shrink-0">Admin Portal</span>
+                            <ChevronRight size={14} className="text-slate-400 shrink-0" />
+                            <span className="font-semibold text-slate-900 dark:text-slate-100 truncate max-w-[140px] lg:max-w-[200px]">
+                                {currentTabObj.label}
+                            </span>
+                        </div>
+
+                        {/* Mobile Tab Title (Phone) */}
+                        <span className="md:hidden font-bold text-xs text-slate-900 dark:text-slate-100 truncate max-w-[130px] sm:max-w-[180px]">
+                            {currentTabObj.label}
+                        </span>
+                    </div>
+
+                    {/* Right-aligned Header Telemetry & User Controls */}
+                    <div className="flex items-center gap-2 sm:gap-3 shrink-0 min-w-0">
+                        {/* Return to Chat App Button */}
+                        <button
+                            onClick={() => navigate('/chat')}
+                            className="p-1.5 sm:px-3 sm:py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors shrink-0 flex items-center gap-1.5"
+                            title="Return to NovaChat Messenger"
+                        >
+                            <MessageCircle size={15} className="text-emerald-500 shrink-0" />
+                            <span className="hidden sm:inline">User App</span>
+                        </button>
+
+                        {/* Live Telemetry Pulse (Only on very wide screens xl: >= 1280px) */}
+                        <div className="hidden xl:flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 shrink-0">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                            <span>System Nominal</span>
+                        </div>
+
+                        {/* Admin Identity Badge */}
+                        <div className="flex items-center gap-2 shrink-0">
+                            <div className="text-right hidden sm:block max-w-[100px] md:max-w-[130px] lg:max-w-[160px] truncate">
+                                <p className="text-xs font-bold text-slate-900 dark:text-slate-100 leading-none truncate">
+                                    {currentUser?.displayName || currentUser?.email?.split('@')[0] || 'Administrator'}
+                                </p>
+                                <span className="text-[10px] text-indigo-600 dark:text-indigo-400 font-bold uppercase tracking-wider block mt-0.5 truncate">
+                                    {currentUser?.role || 'SuperAdmin'}
+                                </span>
                             </div>
+                            <Avatar
+                                src={currentUser?.avatar_url || currentUser?.photoURL}
+                                alt="Admin"
+                                fallback="A"
+                                size="sm"
+                                className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-700 shrink-0"
+                            />
                         </div>
                     </div>
+                </header>
 
-                    <div className="flex-1 overflow-hidden relative">
-                        {/* Tab Content with simple exit/entry animation logic if needed */}
-                        <div className="h-full w-full overflow-hidden">
-                            {activeTab === 'overview' && <AdminOverview />}
-                            {activeTab === 'registry' && (
-                                <UserRegistry
-                                    onOpenDossier={setSelectedUserDossier}
-                                    onBan={handleBan}
-                                    onNuke={handleNuke}
-                                />
-                            )}
-                            {activeTab === 'moderation' && <ModerationQueue />}
-                            {activeTab === 'announcements' && <Announcements />}
+                {/* Viewport Content */}
+                <main className="flex-1 overflow-hidden relative w-full">
+                    {activeTab === 'overview' && <AdminOverview />}
+                    {activeTab === 'registry' && <UserRegistry onOpenDossier={setSelectedUserDossier} />}
+                    {activeTab === 'moderation' && <ModerationQueue />}
+                    {activeTab === 'conversations' && <ConversationModeration />}
+                    {activeTab === 'announcements' && <Announcements />}
+                    {activeTab === 'locations' && <GodMap />}
+                    {activeTab === 'audit' && <AdminAuditLogs />}
+                </main>
+            </div>
 
-                            {activeTab === 'spy' && (
-                                <div className="flex flex-col lg:flex-row h-full w-full">
-                                    <div className={`${spyChatId ? 'hidden lg:flex' : 'flex'} w-full lg:w-[340px] h-full flex-shrink-0 border-r border-gray-200 dark:border-gray-800 flex-col`}>
-                                        <ChatSelector
-                                            onSelectChat={setSpyChatId}
-                                            onSwitchToRegistry={() => setActiveTab('registry')}
-                                            activeChatId={spyChatId}
-                                            participants={participants}
-                                            setParticipants={setParticipants}
-                                        />
-                                    </div>
-                                    <div className={`${spyChatId ? 'flex' : 'hidden lg:flex'} flex-1 relative bg-gray-50 dark:bg-[#0b0f1a] h-full overflow-hidden flex-col`}>
-                                        {spyChatId ? (
-                                            <SpyChatViewer
-                                                chatId={spyChatId}
-                                                onClose={() => setSpyChatId(null)}
-                                                onOpenDossier={setSelectedUserDossier}
-                                                sharedParticipants={participants}
-                                            />
-                                        ) : (
-                                            <div className="h-full flex items-center justify-center text-gray-400 flex-col space-y-6">
-                                                <div className="relative">
-                                                    <div className="absolute -inset-4 bg-indigo-500/10 blur-2xl rounded-full" />
-                                                    <Eye size={64} className="opacity-20 relative text-indigo-500" />
-                                                </div>
-                                                <div className="text-center">
-                                                    <p className="text-sm font-bold text-gray-500 dark:text-gray-400 tracking-wide uppercase">Monitoring Inactive</p>
-                                                    <p className="text-xs text-gray-400 mt-2">Select a neural feed to monitor real-time traffic</p>
-                                                </div>
-                                            </div>
-                                        )}
-                                    </div>
-                                </div>
-                            )}
-
-                            {activeTab === 'map' && <GodMap />}
-                        </div>
-                    </div>
-                </div>
-            </main>
-
-            {/* Global Dossier Modal */}
+            {/* Global User Dossier Modal */}
             {selectedUserDossier && (
                 <UserDossier
                     user={selectedUserDossier}
                     onClose={() => setSelectedUserDossier(null)}
-                    onBan={handleBan}
-                    onNuke={handleNuke}
                 />
             )}
         </div>

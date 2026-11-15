@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Input } from "../ui/Input";
 import { Button } from "../ui/Button";
 import { getSmartReplies } from "../../services/AIAgentService";
-import { lightningSync } from "../../services/LightningService";
+import { chatService } from "../../services/chatService";
 
 export function MessageInput({
     handleSendMessage,
@@ -58,11 +58,12 @@ export function MessageInput({
 
         if (!chat?.id || !currentUser?.uid) return;
 
+        const currentId = currentUser?.uid || currentUser?.id;
         // Typing indicator
-        lightningSync.setTyping(chat.id, currentUser.uid, true);
+        chatService.setTypingStatus(chat.id, currentId, true);
         if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
         typingTimeoutRef.current = setTimeout(() => {
-            lightningSync.setTyping(chat.id, currentUser.uid, false);
+            chatService.setTypingStatus(chat.id, currentId, false);
         }, 3000);
     };
 
@@ -80,9 +81,9 @@ export function MessageInput({
         try {
             await handleSendMessage(textToSend, savedReply);
             setSuggestions([]);
-            // Ensure typing is cleared
+            const currentId = currentUser?.uid || currentUser?.id;
             if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
-            lightningSync.setTyping(chat.id, currentUser.uid, false);
+            chatService.setTypingStatus(chat.id, currentId, false);
         } catch (err) {
             // Restore on failure
             setText(savedText);

@@ -1,8 +1,6 @@
-import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from './AuthContext';
-import { subscribeToUserChats } from '../services/chatListService';
-import { db } from '../firebase';
-import { doc, updateDoc } from 'firebase/firestore';
+import { chatService } from '../services/chatService';
 
 const ChatContext = createContext();
 
@@ -15,40 +13,38 @@ export function ChatProvider({ children }) {
     const [chats, setChats] = useState([]);
     const [loading, setLoading] = useState(true);
 
+    const refreshChats = useCallback(async () => {
+        if (!currentUser?.id) return;
+        try {
+            const list = await chatService.getUserChats(currentUser.id);
+            setChats(list);
+        } catch (err) {
+            console.error('[ChatContext] Failed to load chats:', err);
+        } finally {
+            setLoading(false);
+        }
+    }, [currentUser]);
+
     useEffect(() => {
-        if (!currentUser) {
+        if (!currentUser?.id) {
             setChats([]);
             setLoading(false);
             return;
         }
 
-        const unsubscribe = subscribeToUserChats(currentUser.uid, (chatData) => {
-            // Apply global filters (Hidden chats, Cleared history)
-            const filteredChats = chatData.filter(chat => {
-                const clearedAt = chat.clearedAt?.[currentUser.uid]?.toDate?.() || 0;
-                const lastMsgTime = chat.lastMessageTimestamp?.toDate?.() || null;
-                const isHidden = chat.hiddenBy?.includes(currentUser.uid);
-
-                // Allow chats with pending (null) timestamps to show up (newly created)
-                // But hide if cleared after the last message
-                return (!lastMsgTime || lastMsgTime > clearedAt) && !isHidden;
-            });
-
-            setChats(filteredChats);
-            setLoading(false);
-        }, 30, 'ChatContext'); // 30 limit provided to service
-
-        return () => unsubscribe();
-    }, [currentUser?.uid]);
+        refreshChats();
+    }, [currentUser, refreshChats]);
 
     const value = useMemo(() => ({
         chats,
         loading,
-        // Helper to archive/hide chat (optimistic update could be added here)
-        archiveChat: async (chatId) => {
-            // Implementation for archive if needed
-        }
-    }), [chats, loading]);
+        refreshChats,
+        createDirectChat: (targetId) => chatService.createDirectChat(currentUser.id, targetId),
+        createGroupChat: (title, memberIds) => chatService.createGroupChat(title, memberIds, currentUser.id),
+        deleteChat: async () => {},
+        hideChat: async () => {},
+        clearHistory: async () => {}
+    }), [chats, loading, refreshChats, currentUser]);
 
     return (
         <ChatContext.Provider value={value}>

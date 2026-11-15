@@ -1,51 +1,25 @@
-/* eslint-env node */
-import { defineConfig, loadEnv } from 'vite'
-import react from '@vitejs/plugin-react'
-import { VitePWA } from 'vite-plugin-pwa'
+import { defineConfig, loadEnv } from 'vite';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
 
-// https://vite.dev/config/
-// Final Deployment Trigger
 export default defineConfig(({ mode }) => {
-  // Load env file based on `mode` in the current working directory.
-  // Set the third parameter to '' to load all env regardless of the `VITE_` prefix.
   const env = loadEnv(mode, process.cwd(), '');
-
-  // Build-time validation for environment variables (Moved inside to access 'env')
-  if (mode === 'production') {
-    const requiredEnv = [
-      'VITE_FIREBASE_API_KEY',
-      'VITE_FIREBASE_AUTH_DOMAIN',
-      'VITE_FIREBASE_PROJECT_ID',
-      'VITE_FIREBASE_STORAGE_BUCKET',
-      'VITE_FIREBASE_MESSAGING_SENDER_ID',
-      'VITE_FIREBASE_APP_ID',
-      'VITE_FIREBASE_VAPID_KEY'
-    ];
-    const missing = requiredEnv.filter(key => !env[key]);
-    if (missing.length > 0) {
-      console.warn(`[Build Warning] Missing secrets: ${missing.join(', ')}. App may crash.`);
-      // We don't throw here to allow build to proceed if secrets are injected some other way (e.g. CI)
-    }
-  }
 
   return {
     base: '/',
     plugins: [
       react(),
       VitePWA({
-        strategies: 'injectManifest',
-        srcDir: 'src',
-        filename: 'firebase-messaging-sw.js',
         registerType: 'autoUpdate',
         devOptions: {
-          enabled: true
+          enabled: false
         },
         includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'mask-icon.svg', 'nova-icon.png'],
         manifest: {
-          name: 'Nova',
-          short_name: 'Nova',
-          description: 'AI-Powered Messaging',
-          theme_color: '#1e293b',
+          name: 'NovaChat',
+          short_name: 'NovaChat',
+          description: 'Next-Gen Realtime Messaging Powered by Supabase',
+          theme_color: '#10b981',
           background_color: '#0f172a',
           display: 'standalone',
           orientation: 'portrait-primary',
@@ -63,24 +37,7 @@ export default defineConfig(({ mode }) => {
               type: 'image/png',
               purpose: 'maskable'
             }
-          ],
-          screenshots: [
-            {
-              src: "/nova-icon.png",
-              sizes: "512x512",
-              type: "image/png",
-              form_factor: "wide",
-              label: "Desktop"
-            },
-            {
-              src: "/nova-icon.png",
-              sizes: "512x512",
-              type: "image/png",
-              form_factor: "narrow",
-              label: "Mobile"
-            }
-          ],
-          gcm_sender_id: '103953800507'
+          ]
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,mp3}'],
@@ -99,67 +56,29 @@ export default defineConfig(({ mode }) => {
                   statuses: [0, 200]
                 }
               }
-            },
-            {
-              urlPattern: /^https:\/\/upload\.wikimedia\.org\/.*/i,
-              handler: 'StaleWhileRevalidate',
-              options: {
-                cacheName: 'external-assets-cache',
-                cacheableResponse: {
-                  statuses: [0, 200]
-                }
-              }
-            },
-            {
-              urlPattern: /^https:\/\/firebasestorage\.googleapis\.com\/.*/i,
-              handler: 'StaleWhileRevalidate',
-              options: {
-                cacheName: 'firebase-storage-images',
-                cacheableResponse: {
-                  statuses: [0, 200]
-                }
-              }
             }
           ]
-        },
-        injectManifest: {
-          rollupOptions: {
-            output: {
-              entryFileNames: 'firebase-messaging-sw.js',
-              manualChunks: undefined
-            }
-          },
-          injectionPoint: 'self.__WB_MANIFEST',
         }
       })
     ],
     define: {
-      // Force explicit injection for critical variables
-      'import.meta.env.VITE_FIREBASE_API_KEY': JSON.stringify(env.VITE_FIREBASE_API_KEY || ""),
-      'import.meta.env.VITE_FIREBASE_AUTH_DOMAIN': JSON.stringify(env.VITE_FIREBASE_AUTH_DOMAIN || ""),
-      'import.meta.env.VITE_FIREBASE_PROJECT_ID': JSON.stringify(env.VITE_FIREBASE_PROJECT_ID || ""),
-      'import.meta.env.VITE_FIREBASE_STORAGE_BUCKET': JSON.stringify(env.VITE_FIREBASE_STORAGE_BUCKET || ""),
-      'import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID': JSON.stringify(env.VITE_FIREBASE_MESSAGING_SENDER_ID || ""),
-      'import.meta.env.VITE_FIREBASE_APP_ID': JSON.stringify(env.VITE_FIREBASE_APP_ID || ""),
-      'import.meta.env.VITE_FIREBASE_DATABASE_URL': JSON.stringify(env.VITE_FIREBASE_DATABASE_URL || ""),
-      'import.meta.env.VITE_FIREBASE_VAPID_KEY': JSON.stringify(env.VITE_FIREBASE_VAPID_KEY || ""),
-      'import.meta.env.VITE_GEMINI_API_KEY': JSON.stringify(env.VITE_GEMINI_API_KEY || ""),
-      'import.meta.env.VITE_GOOGLE_MAPS_API_KEY': JSON.stringify(env.VITE_GOOGLE_MAPS_API_KEY || ""),
-      'import.meta.env.VITE_METERED_API_KEY': JSON.stringify(env.VITE_METERED_API_KEY || ""),
-      'import.meta.env.VITE_TURN_SERVER_URL': JSON.stringify(env.VITE_TURN_SERVER_URL || ""),
-      'import.meta.env.VITE_TURN_SERVER_USER': JSON.stringify(env.VITE_TURN_SERVER_USER || ""),
-      'import.meta.env.VITE_TURN_SERVER_PWD': JSON.stringify(env.VITE_TURN_SERVER_PWD || ""),
+      'import.meta.env.VITE_SUPABASE_URL': JSON.stringify(env.VITE_SUPABASE_URL || "https://fijjtocoiaumfxzdjxbi.supabase.co"),
+      'import.meta.env.VITE_SUPABASE_ANON_KEY': JSON.stringify(env.VITE_SUPABASE_ANON_KEY || ""),
+      'import.meta.env.VITE_MAPMYINDIA_API_KEY': JSON.stringify(env.VITE_MAPMYINDIA_API_KEY || "dtbcmezcuovukpygcuegiuimtvizaohaamid"),
+      'import.meta.env.VITE_MAPPLS_API_KEY': JSON.stringify(env.VITE_MAPPLS_API_KEY || "dtbcmezcuovukpygcuegiuimtvizaohaamid"),
+      'import.meta.env.VITE_GOOGLE_MAPS_API_KEY': JSON.stringify(env.VITE_GOOGLE_MAPS_API_KEY || "")
     },
     build: {
       target: 'esnext',
-      minify: 'terser',
       rollupOptions: {
         output: {
           manualChunks: {
             'react-vendor': ['react', 'react-dom', 'react-router-dom'],
-            'firebase-vendor': ['firebase/app', 'firebase/auth', 'firebase/firestore', 'firebase/database', 'firebase/storage', 'firebase/messaging', 'firebase/functions'],
+            'supabase-vendor': ['@supabase/supabase-js'],
             'ui-vendor': ['framer-motion', 'lucide-react', 'react-virtuoso'],
             'utils-vendor': ['date-fns', 'clsx', 'tailwind-merge'],
+            'geo-vendor': ['leaflet', 'react-leaflet'],
+            'chart-vendor': ['recharts']
           }
         }
       }

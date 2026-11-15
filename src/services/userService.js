@@ -1,160 +1,146 @@
-import { db } from "../firebase";
-import { collection, query, where, getDocs, limit, doc, updateDoc, arrayUnion, arrayRemove, documentId, orderBy, startAfter } from "firebase/firestore";
+import { supabase } from "../supabase";
 
-/**
- * Searches for users by email or display name using prefix search with pagination.
- * @param {string} searchTerm - The search term.
- * @param {string} currentUserId - The ID of the current user to exclude.
- * @param {Object} lastDoc - The last document snapshot for pagination.
- * @param {number} pageSize - Number of results to fetch.
- * @returns {Promise<Object>} - { users: Array, lastDoc: Object }
- */
-export const searchUsersPaged = async (searchTerm, currentUserId, lastDoc = null, pageSize = 20) => {
-    const term = (searchTerm || "").toLowerCase().trim();
-    if (!term) return { users: [], lastDoc: null };
+export const userService = {
+    // 1. Search users with server-side pagination
+    searchUsers: async (searchTerm, currentUserId) => {
+        if (!searchTerm || !searchTerm.trim()) return [];
 
-    const usersRef = collection(db, "users");
-    // We fetch more to account for in-memory filtering of system/self users
-    const FETCH_LIMIT = pageSize + 10;
+        const term = `%${searchTerm.trim().toLowerCase()}%`;
+        const { data, error } = await supabase
+            .from('users')
+            .select('id, display_name, email, avatar_url, about_status, last_seen_at')
+            .or(`searchable_name.ilike.${term},email.ilike.${term}`)
+            .neq('id', currentUserId)
+            .limit(20);
 
-    // Determine query strategy
-    const qBase = query(
-        usersRef,
-        term.includes('@')
-            ? where('email', '>=', term)
-            : where('searchableName', '>=', term),
-        term.includes('@')
-            ? where('email', '<=', term + '\uf8ff')
-            : where('searchableName', '<=', term + '\uf8ff'),
-        orderBy(term.includes('@') ? 'email' : 'searchableName'),
-        limit(FETCH_LIMIT)
-    );
-
-    const q = lastDoc ? query(qBase, startAfter(lastDoc)) : qBase;
-
-    try {
-        const snap = await getDocs(q);
-        const users = [];
-        let finalLastDoc = snap.docs[snap.docs.length - 1] || null;
-
-        snap.forEach(doc => {
-            const data = doc.data();
-            // Filter system/self users using explicit flags
-            if (doc.id !== currentUserId && !data.superAdmin && !data.isAdmin && !data.isGemini && !data.isSystemUser) {
-                users.push({ id: doc.id, ...data });
-            }
-        });
-
-        return {
-            users: users.slice(0, pageSize),
-            lastDoc: finalLastDoc
-        };
-    } catch (error) {
-        console.error("Error searching users paged:", error);
-        return { users: [], lastDoc: null };
-    }
-};
-
-/**
- * LEGACY: Kept for compatibility, but searchUsersPaged is preferred for scale.
- */
-export const searchUsers = async (searchTerm, currentUserId) => {
-    const { users } = await searchUsersPaged(searchTerm, currentUserId, null, 10);
-    return users;
-};
-
-/**
- * Blocks a user using Cloud Function for atomic cleanup.
- */
-export const blockUser = async (currentUserId, targetUserId) => {
-    const { getFunctions, httpsCallable } = await import('firebase/functions');
-    const functions = getFunctions();
-    const blockFunc = httpsCallable(functions, 'blockUser');
-    return blockFunc({ targetUserId });
-};
-
-/**
- * Unblocks a user using Cloud Function.
- */
-export const unblockUser = async (currentUserId, targetUserId) => {
-    const { getFunctions, httpsCallable } = await import('firebase/functions');
-    const functions = getFunctions();
-    const unblockFunc = httpsCallable(functions, 'unblockUser');
-    return unblockFunc({ targetUserId });
-};
-/**
- * Fetches multiple user profiles by ID in batches.
- * Uses firestore 'in' query to reduce network round-trips.
- * @param {string[]} userIds - Array of user IDs.
- * @returns {Promise<Array>} - Array of user objects.
- */
-export const getUsersByIds = async (userIds) => {
-    if (!userIds || userIds.length === 0) return [];
-
-    // Firestore 'in' query limit is 30 (technically 10 in some older docs, but 30 is safe now for documentId).
-    // Safest standard batch size is 10 to avoid any edge cases with complex queries.
-    const CHUNK_SIZE = 10;
-    const uniqueIds = [...new Set(userIds)];
-    const chunks = [];
-
-    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
-        chunks.push(uniqueIds.slice(i, i + CHUNK_SIZE));
-    }
-
-    try {
-        const results = await Promise.all(
-            chunks.map(async (chunk) => {
-                const q = query(
-                    collection(db, "users"),
-                    where(documentId(), "in", chunk)
-                );
-                const snap = await getDocs(q);
-                return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-            })
-        );
-        return results.flat();
-    } catch (e) {
-        console.error("Error fetching users batch:", e);
-        return [];
-    }
-};
-
-/**
- * Fetches users in pages using cursor-based pagination.
- * @param {Object} lastDoc - The last document snapshot from previous page.
- * @param {number} pageSize - Number of users per page.
- * @param {string} currentUserId - The ID of the current user to exclude.
- * @returns {Promise<Object>} - { users: Array, lastDoc: Object }
- */
-export const getPagedUsers = async (lastDoc = null, pageSize = 15, currentUserId = null) => {
-    try {
-        let q = query(
-            collection(db, "users"),
-            orderBy("displayName"),
-            limit(pageSize + 10)
-        );
-
-        if (lastDoc) {
-            q = query(q, startAfter(lastDoc));
+        if (error) {
+            console.error('[userService] Search error:', error);
+            return [];
         }
 
-        const snapshot = await getDocs(q);
+        return data.map(u => ({
+            id: u.id,
+            uid: u.id,
+            displayName: u.display_name,
+            email: u.email,
+            photoURL: u.avatar_url,
+            aboutStatus: u.about_status,
+            lastSeen: u.last_seen_at
+        }));
+    },
 
-        const users = snapshot.docs
-            .map(doc => ({ id: doc.id, ...doc.data() }))
-            .filter(u => {
-                // Filter system/self users using explicit flags
-                return u.id !== currentUserId && !u.superAdmin && !u.isAdmin && !u.isGemini && !u.isSystemUser;
-            })
-            .slice(0, pageSize);
+    searchUsersPaged: async (searchTerm, currentUserId, pageOrCursor = 1, pageSize = 20) => {
+        const page = typeof pageOrCursor === 'number' && pageOrCursor > 0 ? pageOrCursor : 1;
+        const from = (page - 1) * pageSize;
+        const to = from + pageSize - 1;
+
+        let query = supabase
+            .from('users')
+            .select('id, display_name, email, avatar_url, about_status, last_seen_at', { count: 'exact' })
+            .neq('id', currentUserId);
+
+        if (searchTerm && searchTerm.trim()) {
+            const term = `%${searchTerm.trim().toLowerCase()}%`;
+            query = query.or(`searchable_name.ilike.${term},email.ilike.${term}`);
+        }
+
+        query = query.order('display_name', { ascending: true }).range(from, to);
+
+        const { data, count, error } = await query;
+        if (error) {
+            console.error('[userService] Paginated search error:', error);
+            return { users: [], lastDoc: null, totalCount: 0, page, pageSize, totalPages: 1 };
+        }
+
+        const users = (data || []).map(u => ({
+            id: u.id,
+            uid: u.id,
+            displayName: u.display_name,
+            email: u.email,
+            photoURL: u.avatar_url,
+            aboutStatus: u.about_status,
+            lastSeen: u.last_seen_at
+        }));
 
         return {
             users,
-            lastDoc: snapshot.docs[snapshot.docs.length - 1] || null
+            lastDoc: users.length === pageSize ? page + 1 : null,
+            totalCount: count || 0,
+            page,
+            pageSize,
+            totalPages: Math.max(1, Math.ceil((count || 0) / pageSize))
         };
-    } catch (e) {
-        console.error("Error fetching paged users:", e);
-        return { users: [], lastDoc: null };
+    },
+
+    // 2. Block/unblock user
+    blockUser: async (currentUserId, targetUserId) => {
+        return supabase.from('contacts').upsert({
+            user_id: currentUserId,
+            contact_user_id: targetUserId,
+            status: 'blocked'
+        });
+    },
+
+    unblockUser: async (currentUserId, targetUserId) => {
+        return supabase.from('contacts').delete().match({
+            user_id: currentUserId,
+            contact_user_id: targetUserId,
+            status: 'blocked'
+        });
+    },
+
+    // 3. User lists with pagination
+    getPagedUsers: async (pageOrCursor = 1, pageSize = 20) => {
+        const page = typeof pageOrCursor === 'number' && pageOrCursor > 0 ? pageOrCursor : 1;
+        const from = (page - 1) * pageSize;
+        const to = from + pageSize - 1;
+
+        const { data, count, error } = await supabase
+            .from('users')
+            .select('id, display_name, email, avatar_url, about_status, last_seen_at', { count: 'exact' })
+            .order('created_at', { ascending: false })
+            .range(from, to);
+
+        if (error) throw error;
+
+        const users = (data || []).map(u => ({
+            id: u.id,
+            uid: u.id,
+            displayName: u.display_name,
+            email: u.email,
+            photoURL: u.avatar_url,
+            aboutStatus: u.about_status,
+            lastSeen: u.last_seen_at
+        }));
+
+        return {
+            users,
+            lastDoc: users.length === pageSize ? page + 1 : null,
+            totalCount: count || 0,
+            page,
+            pageSize,
+            totalPages: Math.max(1, Math.ceil((count || 0) / pageSize))
+        };
+    },
+
+    getUsersByIds: async (ids = []) => {
+        if (!ids || ids.length === 0) return [];
+        const { data } = await supabase.from('users').select('*').in('id', ids);
+        return (data || []).map(u => ({
+            id: u.id,
+            uid: u.id,
+            displayName: u.display_name,
+            email: u.email,
+            photoURL: u.avatar_url,
+            aboutStatus: u.about_status
+        }));
     }
 };
 
+export const searchUsers = userService.searchUsers;
+export const searchUsersPaged = userService.searchUsersPaged;
+export const getPagedUsers = userService.getPagedUsers;
+export const getUsersByIds = userService.getUsersByIds;
+export const blockUser = userService.blockUser;
+export const unblockUser = userService.unblockUser;
+export default userService;

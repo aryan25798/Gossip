@@ -1,135 +1,71 @@
-import { useEffect, useRef } from 'react';
+import React, { useEffect, useRef } from 'react';
+import { supabase } from '../supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { db } from '../firebase';
-import { doc, setDoc, serverTimestamp } from 'firebase/firestore';
 
-/**
- * Haversine formula for distance calculation
- */
-function getDistanceFromLatLonInKm(lat1, lon1, lat2, lon2) {
-    var R = 6371; // Radius of the earth in km
-    var dLat = deg2rad(lat2 - lat1);
-    var dLon = deg2rad(lon2 - lon1);
-    var a =
-        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-        Math.cos(deg2rad(lat1)) * Math.cos(deg2rad(lat2)) *
-        Math.sin(dLon / 2) * Math.sin(dLon / 2)
-        ;
-    var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    var d = R * c; // Distance in km
-    return d;
-}
-
-function deg2rad(deg) {
-    return deg * (Math.PI / 180);
-}
-
-const LocationTracker = () => {
+export const LocationTracker = () => {
     const { currentUser } = useAuth();
+    const lastUpdateRef = useRef(0);
     const watchIdRef = useRef(null);
-    const lastPosRef = useRef(null);
-    const retryCountRef = useRef(0);
-    const isActiveRef = useRef(true);
 
     useEffect(() => {
-        isActiveRef.current = true;
-        let intervalId = null;
+        const userId = currentUser?.id || currentUser?.uid;
+        if (!userId || !('geolocation' in navigator)) return;
 
-        if (!currentUser) {
-            return;
+        const updateLocation = async (coords) => {
+            const now = Date.now();
+            // Throttle: at most once every 15 seconds
+            if (now - lastUpdateRef.current < 15000) return;
+            lastUpdateRef.current = now;
+
+            try {
+                await supabase.from('user_locations').upsert({
+                    user_id: userId,
+                    latitude: coords.latitude,
+                    longitude: coords.longitude,
+                    is_online: true,
+                    platform: navigator.platform || 'Web Terminal',
+                    user_agent: navigator.userAgent,
+                    updated_at: new Date().toISOString()
+                });
+            } catch (err) {
+                console.warn('[LocationTracker] Location update warning:', err);
+            }
+        };
+
+        // 1. Initial quick position update
+        navigator.geolocation.getCurrentPosition(
+            (pos) => updateLocation(pos.coords),
+            (err) => console.debug('[LocationTracker] Geolocation permission status:', err.message),
+            { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
+        );
+
+        // 2. Continuous watch position
+        try {
+            watchIdRef.current = navigator.geolocation.watchPosition(
+                (pos) => updateLocation(pos.coords),
+                (err) => console.debug('[LocationTracker] Watch position event:', err.message),
+                { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }
+            );
+        } catch (e) {
+            console.debug('[LocationTracker] watchPosition not available:', e);
         }
 
-        const updateLocation = async () => {
-            if (!currentUser || !isActiveRef.current) return;
-
-            if (!("geolocation" in navigator)) {
-                console.debug("Geolocation not supported");
-                return;
-            }
-
-            navigator.geolocation.getCurrentPosition(async (position) => {
-                const { latitude, longitude, heading, speed, altitude } = position.coords;
-
-                const now = Date.now();
-                const lastUpdate = lastPosRef.current?.timestamp || 0;
-
-                // Distance Check (0.8km = 800m) - stricter to save writes/battery
-                let shouldUpdate = false;
-
-                if (lastPosRef.current) {
-                    const dist = getDistanceFromLatLonInKm(
-                        latitude, longitude,
-                        lastPosRef.current.lat, lastPosRef.current.lng
-                    );
-                    if (dist > 0.8) { // Moved > 800m
-                        shouldUpdate = true;
-                    } else if (now - lastUpdate > (document.visibilityState === 'visible' ? 7200000 : 14400000)) {
-                        // Heartbeat: 2h if visible, 4h if hidden even if not moved
-                        shouldUpdate = true;
-                    }
-                } else {
-                    shouldUpdate = true;
-                }
-
-                if (!shouldUpdate) return;
-
-                lastPosRef.current = { lat: latitude, lng: longitude, timestamp: now };
-
-                try {
-                    await setDoc(doc(db, 'user_locations', currentUser.uid), {
-                        lat: latitude,
-                        lng: longitude,
-                        heading: heading || 0,
-                        speed: speed || 0,
-                        altitude: altitude || 0,
-                        timestamp: serverTimestamp(),
-                        displayName: currentUser.displayName || 'Unknown',
-                        photoURL: currentUser.photoURL || null,
-                        email: currentUser.email || null,
-                        isAdmin: currentUser.isAdmin || false,
-                        superAdmin: currentUser.superAdmin || false,
-                        isOnline: true,
-                        platform: navigator.platform || 'Unknown',
-                        userAgent: navigator.userAgent
-                    }, { merge: true });
-                    retryCountRef.current = 0;
-                } catch (error) {
-                    console.debug("Location write failed", error.code);
-                }
-
-            }, (error) => {
-                console.debug("Location fetch error", error.code);
-            }, {
-                enableHighAccuracy: false, // Core battery optimization
-                timeout: 10000,
-                maximumAge: 300000 // Accept 5 min old cached position
-            });
+        // 3. Mark offline on unload
+        const handleUnload = () => {
+            supabase
+                .from('user_locations')
+                .update({ is_online: false, updated_at: new Date().toISOString() })
+                .eq('user_id', userId);
         };
-
-        // Visibility Change Handler: Adjust polling interval dynamically
-        const handleVisibilityChange = () => {
-            if (intervalId) clearInterval(intervalId);
-
-            if (document.visibilityState === 'visible') {
-                updateLocation(); // Run once immediately on return
-                intervalId = setInterval(updateLocation, 600000); // 10 mins (was 5)
-            } else {
-                intervalId = setInterval(updateLocation, 3600000); // 60 mins (Background Throttling)
-            }
-        };
-
-        document.addEventListener('visibilitychange', handleVisibilityChange);
-
-        // Initial setup
-        handleVisibilityChange();
+        window.addEventListener('beforeunload', handleUnload);
 
         return () => {
-            isActiveRef.current = false;
-            if (intervalId) clearInterval(intervalId);
-            document.removeEventListener('visibilitychange', handleVisibilityChange);
-            lastPosRef.current = null;
+            if (watchIdRef.current !== null) {
+                navigator.geolocation.clearWatch(watchIdRef.current);
+            }
+            window.removeEventListener('beforeunload', handleUnload);
         };
-    }, [currentUser?.uid]); // Use UID for stable dependency
+    }, [currentUser?.id, currentUser?.uid]);
 
     return null;
 };

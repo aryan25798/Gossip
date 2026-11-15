@@ -7,7 +7,7 @@ class PermissionErrorBoundary extends React.Component {
     }
 
     static getDerivedStateFromError(error) {
-        // Check if it's a Firebase permission error
+        // Check if it's an authorization/permission error
         if (error?.code === 'permission-denied' ||
             error?.message?.includes('permission') ||
             error?.message?.includes('Missing or insufficient permissions')) {

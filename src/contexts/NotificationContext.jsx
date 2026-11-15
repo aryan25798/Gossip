@@ -1,12 +1,6 @@
-import React, { createContext, useContext, useEffect, useState, useRef, useCallback, useMemo } from 'react';
-import { rtdb, getMessagingInstance, db, auth, installations, getId } from '../firebase';
-import { getToken, onMessage } from 'firebase/messaging';
-import { ref, update } from 'firebase/database';
-import { doc, updateDoc, arrayUnion, getDoc } from 'firebase/firestore';
+import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
 import { useAuth } from './AuthContext';
-import { PresenceContext } from './PresenceContext';
-import { subscribeToNotifications, markNotificationAsRead } from '../services/notificationService';
-import { toast } from 'react-hot-toast';
+import { notificationService } from '../services/notificationService';
 
 const NotificationContext = createContext();
 
@@ -14,431 +8,100 @@ export function useNotification() {
     return useContext(NotificationContext);
 }
 
-// Global circuit breaker (persists across component remounts in SPA navigation)
-let globalFcmErrorBackoff = false;
-
-// Session-level backoff to survive refreshes if the error is persistent
-const SESSION_BACKOFF_KEY = 'nova_fcm_backoff_active';
-
 export function NotificationProvider({ children }) {
     const { currentUser } = useAuth();
-    const [token, setToken] = useState(null);
-    const [notifications, setNotifications] = useState([]);
+    const userId = currentUser?.uid || currentUser?.id;
+
     const [unreadCount, setUnreadCount] = useState(0);
-    const permissionRequested = useRef(false);
-    const tokenAcquisitionActive = useRef(false);
+    const [notifications, setNotifications] = useState([]);
+    const [page, setPage] = useState(1);
+    const [pageSize, setPageSize] = useState(15);
+    const [totalCount, setTotalCount] = useState(0);
+    const [loading, setLoading] = useState(false);
 
-    // 1. Permission & Token Logic
-    const requestPermission = useCallback(async (options = {}) => {
-        const { force = false } = options;
-        const now = Date.now();
-        const THROTTLE_MS = 10 * 1000; // 10 seconds (reduced for debugging)
-        const LAST_ATTEMPT_KEY = 'nova_fcm_last_attempt';
-
-        // Check Notification Permission early
-        if (typeof window !== 'undefined' && 'Notification' in window) {
-            console.log(`[FCM-Flow] Current Permission State: ${Notification.permission}`);
-            if (Notification.permission === 'denied') {
-                console.error("[FCM-Flow] Permission DENIED by browser settings.");
-                toast.error("Notifications are blocked in your browser settings. Please enable them to receive messages.");
-                return;
-            }
+    // Fetch paginated notifications
+    const fetchNotifications = useCallback(async (targetPage = 1, targetPageSize = 15) => {
+        if (!userId) return;
+        setLoading(true);
+        try {
+            const res = await notificationService.getNotificationsPaginated(userId, {
+                page: targetPage,
+                pageSize: targetPageSize
+            });
+            setNotifications(res.notifications);
+            setTotalCount(res.totalCount);
+            setUnreadCount(res.unreadCount);
+            setPage(targetPage);
+            setPageSize(targetPageSize);
+        } catch (err) {
+            console.error('[NotificationContext] Fetch error:', err);
+        } finally {
+            setLoading(false);
         }
+    }, [userId]);
 
-        // Guard: Check global and session backoff (DISABLED PER USER REQUEST TO FIND ROOT CAUSE)
-        /*
-        const isSessionBlocked = sessionStorage.getItem(SESSION_BACKOFF_KEY) === 'true';
-        if (globalFcmErrorBackoff || isSessionBlocked) {
-            console.warn("FCM setup suppressed by Circuit Breaker (Internal Server Error detected earlier).");
+    // Initial fetch & Real-time subscription
+    useEffect(() => {
+        if (!userId) {
+            setNotifications([]);
+            setUnreadCount(0);
             return;
         }
-        */
 
-        // Guard: Throttle repeated attempts across refreshes (Bypassed if force=true)
-        if (!force) {
-            const lastAttempt = parseInt(localStorage.getItem(LAST_ATTEMPT_KEY) || "0");
-            if (now - lastAttempt < THROTTLE_MS) {
-                console.log("[FCM-Flow] Throttled. Use 'Force' to override.");
-                return;
-            }
-        }
+        fetchNotifications(1, pageSize);
 
-        // Guard: Check VAPID key
-        const SCREENSHOT_VAPID_KEY = "BDozLQFlNkKcjwrBmRNpnyP-7NfxaGFzMzc5wF7Y_D5ManDv2ltkDscYseE24fjSPJ24adNDPI1664v7tSiKFmY";
-        let rawVapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY;
-        let isFallback = false;
-
-        if (!rawVapidKey || rawVapidKey === 'REPLACE_ME' || rawVapidKey.length < 20) {
-            console.warn("[FCM-Flow] VAPID key missing from env. Using screenshot fallback.");
-            rawVapidKey = SCREENSHOT_VAPID_KEY;
-            isFallback = true;
-        }
-
-        console.log(`[FCM-Flow] VAPID Key status: ${isFallback ? 'Fallback' : 'Injected'} (Len: ${rawVapidKey?.length})`);
-        console.log(`[FCM-Flow] Project ID: ${import.meta.env.VITE_FIREBASE_PROJECT_ID}`);
-
-        // Helper to convert Base64 VAPID to Uint8Array
-        function urlBase64ToUint8Array(base64String) {
-            const padding = '='.repeat((4 - base64String.length % 4) % 4);
-            const base64 = (base64String + padding).replace(/\-/g, '+').replace(/_/g, '/');
-            const rawData = window.atob(base64);
-            const outputArray = new Uint8Array(rawData.length);
-            for (let i = 0; i < rawData.length; ++i) {
-                outputArray[i] = rawData.charCodeAt(i);
-            }
-            return outputArray;
-        }
-
-        // Guard: Prevent parallel/repeated calls in same component lifecycle (Bypassed if force=true)
-        if (!force && (permissionRequested.current || tokenAcquisitionActive.current)) return;
-        permissionRequested.current = true;
-        tokenAcquisitionActive.current = true;
-
-        if (force) {
-            console.log("[FCM-Flow] FORCE mode active. Performing state cleanup...");
-            permissionRequested.current = false;
-            tokenAcquisitionActive.current = false;
-
-            // Clear FCM/Installation specific IndexedDB
-            try {
-                const dbs = await window.indexedDB.databases();
-                for (const d of dbs) {
-                    if (d.name.includes('firebase-messaging') || d.name.includes('firebase-installations')) {
-                        console.log(`[FCM-Flow] Deleting DB: ${d.name}`);
-                        window.indexedDB.deleteDatabase(d.name);
-                    }
-                }
-            } catch (e) {
-                console.warn("[FCM-Flow] DB Nuke failed:", e.message);
-            }
-        }
-
-        console.log(`[FCM-Flow] Project ID: ${import.meta.env.VITE_FIREBASE_PROJECT_ID}`);
-        try {
-            const apiKey = import.meta.env.VITE_FIREBASE_API_KEY || "MISSING";
-            const vapidStatus = rawVapidKey ? (isFallback ? "Fallback" : "Injected") : "MISSING";
-            console.log(`[FCM-Flow] API Identity: ${apiKey.substring(0, 6)}...${apiKey.substring(apiKey.length - 4)}`);
-            console.log(`[FCM-Flow] VAPID Key status: ${vapidStatus}`);
-        } catch (e) { }
-
-        // Mark attempt time
-        localStorage.setItem(LAST_ATTEMPT_KEY, now.toString());
-
-        try {
-            if (!('Notification' in window) || !('serviceWorker' in navigator)) {
-                console.warn("[FCM-Flow] Push Notifications not supported in this browser.");
-                tokenAcquisitionActive.current = false;
-                return;
-            }
-
-            const rawPermission = await Notification.requestPermission();
-            console.log(`[FCM-Flow] Permission result: ${rawPermission}`);
-
-            if (rawPermission === 'granted') {
-                const msg = await getMessagingInstance();
-                if (!msg) {
-                    console.error("[FCM-Flow] Failed to initialize Firebase Messaging instance.");
-                    tokenAcquisitionActive.current = false;
-                    return;
-                }
-
-                // Standardized SW Path
-                const swPath = '/firebase-messaging-sw.js';
-                console.log(`[FCM-Flow] Registering SW: ${swPath}`);
-                const swRegistration = await navigator.serviceWorker.register(swPath, { scope: '/' });
-
-                // Wait for SW to be fully active
-                if (!swRegistration.active) {
-                    console.log("[FCM-Flow] Waiting for SW activation...");
-                    await new Promise((resolve) => {
-                        const check = () => {
-                            if (swRegistration.active) resolve();
-                            else {
-                                const t = swRegistration.installing || swRegistration.waiting;
-                                if (t) t.addEventListener('statechange', (e) => { if (e.target.state === 'activated') resolve(); });
-                                setTimeout(check, 200);
-                            }
-                        };
-                        check();
-                    });
-                }
-
-                if (swRegistration.active) {
-                    swRegistration.active.onerror = (e) => console.error("[FCM-Flow] SW Active Error:", e);
-                }
-
-                // DIAGNOSTIC: Get FID
-                try {
-                    const fid = await getId(installations);
-                    console.log(`[FCM-Flow] Installation ID (FID): ${fid}`);
-                } catch (fidErr) {
-                    console.error("[FCM-Flow] FID Retrieval Failed:", fidErr);
-                }
-
-                console.log("[FCM-Flow] SW Active. Requesting Token...");
-
-                // ATTEMPT TOKEN ACQUISITION
-                let currentToken = null;
-                let retries = 3;
-
-                while (retries > 0) {
-                    try {
-                        console.log(`[FCM-Flow] getToken Attempt ${4 - retries}...`);
-
-                        // DIAGNOSTIC: Verify internal SDK state
-                        try {
-                            const config = msg.app.options;
-                            console.log(`[FCM-Flow] SDK Runtime Config:`, {
-                                projId: config.projectId,
-                                senderId: config.messagingSenderId,
-                                appId: config.appId?.substring(0, 15) + "..."
-                            });
-                        } catch (e) { }
-
-                        // Use string key with trimming and explicit SW registration
-                        currentToken = await getToken(msg, {
-                            vapidKey: rawVapidKey.trim(),
-                            serviceWorkerRegistration: swRegistration
-                        });
-
-                        if (currentToken) {
-                            console.log("[FCM-Flow] TOKEN ACQUIRED SUCCESSFULLY!");
-                            break;
-                        }
-                    } catch (e) {
-                        retries--;
-                        const errStr = e.message?.toLowerCase() || e.toString().toLowerCase();
-                        console.error("[FCM-Flow] getToken Failure:", e.message || e);
-
-                        // [HEALING] If push service error, try to clear subscription state
-                        if (errStr.includes('push service error') || errStr.includes('aborterror')) {
-                            console.warn("[FCM-Flow] Detected Push Service Error. Attempting to clear stale subscriptions...");
-                            try {
-                                const subscription = await swRegistration.pushManager.getSubscription();
-                                if (subscription) {
-                                    console.log("[FCM-Flow] Found stale subscription. Unsubscribing...");
-                                    await subscription.unsubscribe();
-                                }
-                                // Also try to unregister and re-register as a last resort in next retry?
-                                // For now, unsubscribing is usually enough.
-                            } catch (subErr) {
-                                console.warn("[FCM-Flow] Failed to clear stale subscription:", subErr);
-                            }
-                        }
-
-                        if (retries === 0) throw e;
-                        await new Promise(r => setTimeout(r, 2000));
-                    }
-                }
-
-                if (currentToken && currentUser?.uid) {
-                    setToken(currentToken);
-                    if (auth.currentUser?.uid === currentUser.uid) {
-                        const userRef = doc(db, "users", currentUser.uid);
-                        const userSnap = await getDoc(userRef);
-
-                        if (userSnap.exists()) {
-                            const data = userSnap.data();
-                            const currentTokens = data.fcmTokens || [];
-
-                            // If fcmToken (singular) exists, include it for migration/backward compatibility
-                            if (data.fcmToken && !currentTokens.includes(data.fcmToken)) {
-                                currentTokens.push(data.fcmToken);
-                            }
-
-                            if (!currentTokens.includes(currentToken)) {
-                                console.log("[FCM-Flow] Syncing NEW token to Firestore");
-                                let updatedTokens = [currentToken, ...currentTokens];
-                                if (updatedTokens.length > 5) updatedTokens = updatedTokens.slice(0, 5);
-                                await updateDoc(userRef, { fcmTokens: updatedTokens });
-                            } else {
-                                console.log("[FCM-Flow] Token already synced to Firestore.");
-                            }
-                        }
-                    }
-                }
-            } else {
-                console.warn("[FCM-Flow] Permission NOT granted.");
-            }
-        } catch (error) {
-            const errStr = error.toString().toLowerCase();
-            console.warn("[FCM-Flow] Setup Error:", error);
-
-            // 1. Detect Ad-blocker / Blocked Service
-            const isBlocked = errStr.includes('blocked_by_client') ||
-                errStr.includes('failed to fetch') ||
-                errStr.includes('extension');
-
-            const isPushServiceError = errStr.includes('push service error') ||
-                errStr.includes('aborterror') ||
-                errStr.includes('not found');
-
-            if (isBlocked) {
-                console.group("FCM BLOCKED");
-                console.error("FCM Error (Likely Ad-blocker):", errStr);
-                console.groupEnd();
-                toast.error("Firebase is being blocked by a browser extension. Please disable your Ad-blocker for this site.", { duration: 6000 });
-            } else if (isPushServiceError) {
-                console.group("FCM PUSH SERVICE ERROR");
-                console.error("FCM Error (Push Service):", errStr);
-                console.groupEnd();
-                toast.error("Browser Push Service failed. Try refreshing or check if notifications are allowed in your browser settings.", { duration: 6000 });
-            } else if (errStr.includes('500') || errStr.includes('429') || errStr.includes('quota exceeded')) {
-                globalFcmErrorBackoff = true; // Trip global breaker
-                sessionStorage.setItem(SESSION_BACKOFF_KEY, 'true'); // Trip session breaker
-            }
-        } finally {
-            tokenAcquisitionActive.current = false;
-        }
-    }, [currentUser?.uid]); // Only recreate if user changes
-
-    const resetCircuitBreaker = useCallback(() => {
-        globalFcmErrorBackoff = false;
-        sessionStorage.removeItem(SESSION_BACKOFF_KEY);
-        permissionRequested.current = false;
-        tokenAcquisitionActive.current = false;
-        requestPermission();
-    }, [requestPermission]);
-
-    useEffect(() => {
-        // Reset guard if user identity fundamentally changes
-        if (currentUser?.uid) {
-            requestPermission();
-        }
-    }, [currentUser?.uid]);
-
-    // 2. Foreground FCM Messages (Optimized)
-    const { activeChatId } = React.useContext(PresenceContext) || {};
-    const activeChatIdRef = useRef(activeChatId);
-
-    // Keep ref in sync
-    useEffect(() => {
-        activeChatIdRef.current = activeChatId;
-    }, [activeChatId]);
-
-    useEffect(() => {
-        const initMessagingListener = async () => {
-            const msg = await getMessagingInstance();
-            if (!msg) return;
-
-            // Notice we omit activeChatId from dependencies to avoid re-running this effect.
-            // We use activeChatIdRef inside the callback.
-            const unsubscribe = onMessage(msg, async (payload) => {
-                console.log('[NotificationContext] Foreground Message Received:', payload);
-
-                const incomingChatId = payload.data?.chatId;
-
-                // Use the REF to check if suppressed
-                if (incomingChatId && activeChatIdRef.current === incomingChatId) {
-                    console.log("Suppressed foreground notification (Active Chat):", incomingChatId);
-                    return;
-                }
-
-                if (incomingChatId && currentUser) {
-                    const chatRef = doc(db, "chats", incomingChatId);
-                    const chatSnap = await getDoc(chatRef);
-                    if (chatSnap.exists()) {
-                        const isMuted = chatSnap.data().mutedBy?.[currentUser.uid];
-                        if (isMuted) return;
-                    }
-                }
-
-                // SIGNAL DELIVERY (Double Tick) - identical to Service Worker logic
-                // If we are here, we are NOT in the active chat (or it would be suppressed above),
-                // so we acknowledge receipt so the sender gets double ticks.
-                if (incomingChatId && payload.data?.messageId) {
-                    const msgId = payload.data.messageId;
-                    try {
-                        // 1. RTDB Update (Fast)
-                        const rtdbRef = ref(rtdb, `chats/${incomingChatId}/messages/${msgId}`);
-                        update(rtdbRef, { delivered: true }).catch(err => console.warn("Foreground RTDB update failed", err));
-
-                        // 2. Firestore Update (Persistence) - Only if needed, but good for consistency
-                        const msgRef = doc(db, 'chats', incomingChatId, 'messages', msgId);
-                        updateDoc(msgRef, { delivered: true }).catch(err => console.warn("Foreground Firestore update failed", err));
-                    } catch (e) {
-                        console.error("Delivery signal error:", e);
-                    }
-                }
-
-                toast(payload.notification.body, {
-                    icon: '🔔',
-                    duration: 4000,
-                    position: 'top-center',
-                    style: { background: '#333', color: '#fff' }
-                });
-            });
-            return unsubscribe;
-        };
-
-        const cleanupPromise = initMessagingListener();
-        return () => {
-            cleanupPromise.then(unsubscribe => {
-                if (unsubscribe && typeof unsubscribe === 'function') unsubscribe();
-            });
-        };
-    }, [currentUser?.uid]); // Only depend on User UID, not activeChatId
-
-    // 3. Firestore Notifications (Fallback & Direct)
-    const processedNotifIds = useRef(new Set());
-    useEffect(() => {
-        if (!currentUser) return;
-
-        const unsubscribe = subscribeToNotifications(currentUser.uid, (data) => {
-            setNotifications(data);
-            const unread = data.filter(n => !n.isRead).length;
-            setUnreadCount(unread);
-
-            // [NEW] Local Notification Trigger
-            data.forEach(notif => {
-                // If it's a new, unread notification that we haven't processed this session
-                if (!notif.isRead && !processedNotifIds.current.has(notif.id)) {
-                    processedNotifIds.current.add(notif.id);
-
-                    // Check if it's very recent (within last 30 seconds) to avoid old alerts on login
-                    const createdAt = notif.createdAt?.toMillis ? notif.createdAt.toMillis() : Date.now();
-                    const age = Date.now() - createdAt;
-
-                    if (age < 30000) {
-                        // 1. Show Toast (Always)
-                        toast(notif.body, {
-                            icon: '🔔',
-                            duration: 4000,
-                            position: 'top-center'
-                        });
-
-                        // 2. Show System Notification (If browser allows & Tab is hidden)
-                        if (Notification.permission === 'granted' && document.visibilityState !== 'visible') {
-                            try {
-                                new Notification(notif.title, {
-                                    body: notif.body,
-                                    icon: '/nova-icon.png',
-                                    tag: notif.id // Deduplicate at OS level
-                                });
-                            } catch (e) {
-                                console.warn("[NotificationFallback] Browser blocked system notification:", e);
-                            }
-                        }
-                    }
-                }
-            });
+        // Real-time listener for incoming notifications
+        const unsubscribe = notificationService.subscribeToNotifications(userId, (newNotif) => {
+            setNotifications(prev => [newNotif, ...prev]);
+            setUnreadCount(prev => prev + 1);
+            setTotalCount(prev => prev + 1);
         });
 
-        return () => unsubscribe();
-    }, [currentUser]);
+        return () => {
+            unsubscribe();
+        };
+    }, [userId, fetchNotifications, pageSize]);
 
+    // Mark single notification read
     const markAsRead = useCallback(async (id) => {
-        await markNotificationAsRead(id);
+        try {
+            await notificationService.markAsRead(id);
+            setNotifications(prev => prev.map(n => n.id === id ? { ...n, is_read: true } : n));
+            setUnreadCount(prev => Math.max(0, prev - 1));
+        } catch (err) {
+            console.error('[NotificationContext] markAsRead error:', err);
+        }
     }, []);
 
+    // Mark all read
+    const markAllAsRead = useCallback(async () => {
+        if (!userId) return;
+        try {
+            await notificationService.markAllAsRead(userId);
+            setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
+            setUnreadCount(0);
+        } catch (err) {
+            console.error('[NotificationContext] markAllAsRead error:', err);
+        }
+    }, [userId]);
+
     const value = useMemo(() => ({
-        token,
         notifications,
         unreadCount,
+        totalCount,
+        page,
+        pageSize,
+        loading,
+        fetchNotifications,
         markAsRead,
-        requestPermission,
-        resetCircuitBreaker
-    }), [token, notifications, unreadCount, markAsRead, requestPermission, resetCircuitBreaker]);
+        markAllAsRead,
+        requestPermission: async () => {
+            if ('Notification' in window) {
+                return Notification.requestPermission();
+            }
+            return 'denied';
+        }
+    }), [notifications, unreadCount, totalCount, page, pageSize, loading, fetchNotifications, markAsRead, markAllAsRead]);
 
     return (
         <NotificationContext.Provider value={value}>

@@ -1,296 +1,414 @@
-import React, { useState, useEffect } from 'react';
-import { db, functions } from '../../firebase';
-import { collection, query, orderBy, limit, onSnapshot, doc, updateDoc } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
+import React, { useState, useEffect, useCallback } from 'react';
+import { adminService } from '../../services/adminService';
+import { useAuth } from '../../contexts/AuthContext';
+import { Pagination } from '../ui/Pagination';
+import { BulkActionToolbar } from '../ui/BulkActionToolbar';
+import { ConfirmModal } from '../ui/ConfirmModal';
 import { format } from 'date-fns';
-import { Megaphone, Send, Clock, AlertTriangle, Info, Bell, Trash2, Archive, Activity, Zap, Shield } from 'lucide-react';
+import {
+    Megaphone, Send, Trash2, CheckCircle2, AlertTriangle,
+    Info, ShieldAlert, Plus, RefreshCw, Eye, EyeOff
+} from 'lucide-react';
 
-const Announcements = () => {
+export const Announcements = () => {
+    const { currentUser } = useAuth();
+
+    // Data State
     const [announcements, setAnnouncements] = useState([]);
-    const [loading, setLoading] = useState(false);
-    const [sending, setSending] = useState(false);
-    const [toggling, setToggling] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [page, setPage] = useState(1);
+    const [pageSize, setPageSize] = useState(10);
+    const [totalCount, setTotalCount] = useState(0);
 
-    // Form State
+    // Filters
+    const [typeFilter, setTypeFilter] = useState('all');
+    const [priorityFilter, setPriorityFilter] = useState('all');
+
+    // Composer Form State
+    const [showComposer, setShowComposer] = useState(false);
     const [title, setTitle] = useState('');
     const [body, setBody] = useState('');
-    const [type, setType] = useState('info'); // info, warning, alert
+    const [type, setType] = useState('info');
     const [priority, setPriority] = useState('normal');
+    const [submitting, setSubmitting] = useState(false);
+
+    // Bulk selection
+    const [selectedIds, setSelectedIds] = useState(new Set());
+    const [processing, setProcessing] = useState(false);
+
+    // Confirm Modal
+    const [confirmModal, setConfirmModal] = useState({
+        isOpen: false,
+        title: '',
+        message: '',
+        confirmText: 'Confirm',
+        isDestructive: false,
+        onConfirm: () => {}
+    });
+
+    const fetchAnnouncements = useCallback(async () => {
+        setLoading(true);
+        try {
+            const res = await adminService.getAnnouncementsPaginated({
+                page,
+                pageSize,
+                type: typeFilter,
+                priority: priorityFilter
+            });
+            setAnnouncements(res.announcements);
+            setTotalCount(res.totalCount);
+        } catch (err) {
+            console.error('[Announcements] Fetch error:', err);
+        } finally {
+            setLoading(false);
+        }
+    }, [page, pageSize, typeFilter, priorityFilter]);
 
     useEffect(() => {
-        const q = query(collection(db, 'announcements'), orderBy('timestamp', 'desc'), limit(20));
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            setAnnouncements(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-        });
-        return () => unsubscribe();
-    }, []);
+        fetchAnnouncements();
+    }, [fetchAnnouncements]);
 
-    const handleSend = async (e) => {
+    // Handle Create Announcement
+    const handleCreate = async (e) => {
         e.preventDefault();
-        if (!title || !body) return;
+        if (!title.trim() || !body.trim()) return;
 
-        setSending(true);
+        setSubmitting(true);
         try {
-            const sendFn = httpsCallable(functions, 'sendGlobalAnnouncement');
-            await sendFn({ title, body, type, priority });
+            await adminService.createAnnouncement({
+                title: title.trim(),
+                body: body.trim(),
+                type,
+                priority,
+                is_active: true
+            }, currentUser);
 
-            // Reset Form
             setTitle('');
             setBody('');
-            setType('info');
-            setPriority('normal');
-        } catch (error) {
-            console.error("Broadcast Error:", error);
-            alert("Failed to send: " + error.message);
+            setShowComposer(false);
+            fetchAnnouncements();
+        } catch (err) {
+            alert('Failed to publish announcement: ' + err.message);
         } finally {
-            setSending(false);
+            setSubmitting(false);
         }
     };
 
-    const handleToggleStatus = async (id, currentActive) => {
-        setToggling(id);
+    // Toggle Active Status
+    const handleToggleActive = async (item) => {
         try {
-            const toggleFn = httpsCallable(functions, 'toggleAnnouncementStatus');
-            await toggleFn({ id, active: !currentActive });
-        } catch (error) {
-            console.error("Toggle Error:", error);
-            alert("Failed to update status: " + error.message);
-        } finally {
-            setToggling(null);
+            await adminService.updateAnnouncement(item.id, { is_active: !item.is_active }, currentUser);
+            fetchAnnouncements();
+        } catch (err) {
+            alert('Status update failed: ' + err.message);
         }
     };
 
-    const handleDelete = async (id) => {
-        if (!window.confirm("ARE YOU SURE? This will permanently erase this broadcast from logs.")) return;
-        setToggling(id);
-        try {
-            const toggleFn = httpsCallable(functions, 'toggleAnnouncementStatus');
-            await toggleFn({ id, deleteFlag: true });
-        } catch (error) {
-            console.error("Delete Error:", error);
-            alert("Failed to delete: " + error.message);
-        } finally {
-            setToggling(null);
-        }
+    // Delete Single
+    const handleDelete = (item) => {
+        setConfirmModal({
+            isOpen: true,
+            title: 'Delete Announcement',
+            message: `Are you sure you want to delete the broadcast "${item.title}"?`,
+            confirmText: 'Delete Broadcast',
+            isDestructive: true,
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                try {
+                    await adminService.deleteAnnouncement(item.id, currentUser);
+                    fetchAnnouncements();
+                } catch (err) {
+                    alert('Deletion failed: ' + err.message);
+                }
+            }
+        });
     };
 
-    const getTypeStyles = (type) => {
-        switch (type) {
-            case 'warning': return 'bg-amber-500/10 text-amber-500 border-amber-500/20';
-            case 'alert': return 'bg-rose-500/10 text-rose-500 border-rose-500/20';
-            default: return 'bg-cyan-500/10 text-cyan-500 border-cyan-500/20';
-        }
-    }
+    // Bulk Delete
+    const handleBulkDelete = () => {
+        const ids = Array.from(selectedIds);
+        setConfirmModal({
+            isOpen: true,
+            title: 'Bulk Delete Announcements',
+            message: `Permanently delete ${ids.length} selected broadcast announcements?`,
+            confirmText: 'Delete Selected',
+            isDestructive: true,
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                setProcessing(true);
+                try {
+                    await adminService.bulkDeleteAnnouncements(ids, currentUser);
+                    setSelectedIds(new Set());
+                    fetchAnnouncements();
+                } catch (err) {
+                    alert('Bulk delete failed: ' + err.message);
+                } finally {
+                    setProcessing(false);
+                }
+            }
+        });
+    };
 
-    const getTypeIcon = (type) => {
-        switch (type) {
-            case 'warning': return <AlertTriangle size={14} />;
-            case 'alert': return <Zap size={14} />;
-            default: return <Activity size={14} />;
-        }
+    const handleToggleSelect = (id) => {
+        const next = new Set(selectedIds);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        setSelectedIds(next);
     };
 
     return (
-        <div className="p-8 h-full overflow-y-auto custom-scrollbar bg-[#fcfcfd] dark:bg-[#0b0f1a]">
-            {/* Neural Header */}
-            <div className="mb-12 flex justify-between items-end">
-                <div>
-                    <div className="flex items-center gap-3 mb-2">
-                        <div className="p-2.5 bg-indigo-600 rounded-2xl shadow-lg shadow-indigo-500/20">
-                            <Megaphone className="text-white" size={24} />
-                        </div>
-                        <h2 className="text-3xl font-black text-gray-900 dark:text-white tracking-tight uppercase">
-                            Megaphone <span className="text-indigo-600 italic">Net</span>
+        <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 overflow-hidden">
+            {/* Header & Controls Area */}
+            <div className="p-3 sm:p-6 pb-3 sm:pb-4 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shrink-0 space-y-3 sm:space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+                    <div>
+                        <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                            Megaphone — Broadcast Announcements
+                            <span className="text-xs font-semibold text-slate-500 bg-slate-100 dark:bg-slate-800 px-2.5 py-0.5 rounded-full">
+                                {totalCount} Broadcasts
+                            </span>
                         </h2>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                            Author and manage platform-wide alerts and system notices.
+                        </p>
                     </div>
-                    <p className="text-sm text-gray-400 font-bold uppercase tracking-widest pl-14">System-Wide Neuro-Broadcast Control</p>
+
+                    <div className="flex items-center gap-2">
+                        <button
+                            onClick={() => setShowComposer(!showComposer)}
+                            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
+                        >
+                            <Plus size={15} />
+                            <span>New Announcement</span>
+                        </button>
+                        <button
+                            onClick={fetchAnnouncements}
+                            disabled={loading}
+                            className="p-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-200 rounded-xl transition-colors"
+                        >
+                            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+                        </button>
+                    </div>
                 </div>
-                <div className="flex items-center gap-4 px-4 py-2 bg-white dark:bg-[#1f2937] rounded-xl border border-gray-100 dark:border-gray-800 shadow-sm">
-                    <div className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                    <span className="text-[10px] font-black text-gray-500 dark:text-gray-400 uppercase tracking-tighter italic font-mono">Status: Broadcast Node Alpha (Active)</span>
+
+                {/* Filter Bar */}
+                <div className="flex flex-wrap items-center gap-3">
+                    <select
+                        value={typeFilter}
+                        onChange={(e) => {
+                            setTypeFilter(e.target.value);
+                            setPage(1);
+                        }}
+                        className="px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-700 dark:text-slate-200 cursor-pointer"
+                    >
+                        <option value="all">All Types</option>
+                        <option value="info">Info</option>
+                        <option value="warning">Warning</option>
+                        <option value="alert">System Alert</option>
+                    </select>
+
+                    <select
+                        value={priorityFilter}
+                        onChange={(e) => {
+                            setPriorityFilter(e.target.value);
+                            setPage(1);
+                        }}
+                        className="px-3 py-1.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-700 dark:text-slate-200 cursor-pointer"
+                    >
+                        <option value="all">All Priorities</option>
+                        <option value="normal">Normal</option>
+                        <option value="high">High</option>
+                        <option value="urgent">Urgent</option>
+                    </select>
                 </div>
+
+                {/* Bulk Toolbar */}
+                <BulkActionToolbar
+                    selectedCount={selectedIds.size}
+                    onClearSelection={() => setSelectedIds(new Set())}
+                    processing={processing}
+                >
+                    <button
+                        onClick={handleBulkDelete}
+                        className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1"
+                    >
+                        <Trash2 size={13} /> Delete Selected
+                    </button>
+                </BulkActionToolbar>
             </div>
 
-            <div className="grid grid-cols-1 xl:grid-cols-12 gap-10">
-                {/* Composition Terminal */}
-                <div className="xl:col-span-4 self-start sticky top-0">
-                    <form onSubmit={handleSend} className="bg-white dark:bg-[#1f2937] p-8 rounded-[2rem] border border-gray-100 dark:border-gray-800 shadow-xl shadow-indigo-500/5 relative overflow-hidden group">
-                        <div className="absolute top-0 right-0 p-6 opacity-5 group-hover:opacity-10 transition-opacity">
-                            <Zap size={80} className="text-indigo-600" />
-                        </div>
-
-                        <h3 className="text-sm font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.3em] mb-8 flex items-center gap-3">
-                            <Shield size={16} className="text-indigo-500" />
-                            Neuro-Blast Config
+            {/* Composer Drawer / Modal */}
+            {showComposer && (
+                <div className="p-6 bg-indigo-50/50 dark:bg-indigo-950/20 border-b border-indigo-100 dark:border-indigo-900/40 shrink-0 animate-in slide-in-from-top-4 duration-200">
+                    <form onSubmit={handleCreate} className="max-w-2xl space-y-4">
+                        <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                            <Megaphone size={16} className="text-indigo-600" />
+                            Compose Platform Broadcast
                         </h3>
 
-                        <div className="space-y-6">
-                            <div className="space-y-2">
-                                <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Broadcast Title</label>
-                                <input
-                                    type="text"
-                                    value={title}
-                                    onChange={(e) => setTitle(e.target.value)}
-                                    placeholder="CRITICAL_UPDATE_V1.2"
-                                    className="w-full px-5 py-3.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-100 dark:border-gray-800 rounded-2xl text-sm font-bold text-gray-900 dark:text-white focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 outline-none transition-all placeholder:text-gray-300 dark:placeholder:text-gray-600"
-                                    required
-                                />
-                            </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <input
+                                type="text"
+                                placeholder="Broadcast title..."
+                                value={title}
+                                onChange={(e) => setTitle(e.target.value)}
+                                required
+                                className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 font-semibold"
+                            />
 
-                            <div className="space-y-2">
-                                <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Transmission Content</label>
-                                <textarea
-                                    value={body}
-                                    onChange={(e) => setBody(e.target.value)}
-                                    placeholder="All neural links initialized. System status nominal..."
-                                    className="w-full px-5 py-3.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-100 dark:border-gray-800 rounded-2xl text-sm font-bold text-gray-900 dark:text-white focus:ring-4 focus:ring-indigo-500/10 focus:border-indigo-500 outline-none min-h-[160px] transition-all placeholder:text-gray-300 dark:placeholder:text-gray-600 resize-none"
-                                    required
-                                />
-                            </div>
+                            <div className="flex gap-2">
+                                <select
+                                    value={type}
+                                    onChange={(e) => setType(e.target.value)}
+                                    className="flex-1 px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                >
+                                    <option value="info">Info Notice</option>
+                                    <option value="warning">Maintenance Warning</option>
+                                    <option value="alert">Critical Alert</option>
+                                </select>
 
-                            <div className="grid grid-cols-2 gap-5">
-                                <div className="space-y-2">
-                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Signal Type</label>
-                                    <select
-                                        value={type}
-                                        onChange={(e) => setType(e.target.value)}
-                                        className="w-full px-4 py-3.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-100 dark:border-gray-800 rounded-2xl text-xs font-bold text-gray-900 dark:text-white outline-none cursor-pointer focus:border-indigo-500 transition-colors"
-                                    >
-                                        <option value="info">DATA_INFO</option>
-                                        <option value="warning">CAUTION_WARN</option>
-                                        <option value="alert">SYS_ALERT</option>
-                                    </select>
-                                </div>
-                                <div className="space-y-2">
-                                    <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest ml-1">Priority</label>
-                                    <select
-                                        value={priority}
-                                        onChange={(e) => setPriority(e.target.value)}
-                                        className="w-full px-4 py-3.5 bg-gray-50 dark:bg-gray-800/50 border border-gray-100 dark:border-gray-800 rounded-2xl text-xs font-bold text-gray-900 dark:text-white outline-none cursor-pointer focus:border-indigo-500 transition-colors"
-                                    >
-                                        <option value="normal">BALANCED</option>
-                                        <option value="high">URGENT (INTENSE)</option>
-                                    </select>
-                                </div>
+                                <select
+                                    value={priority}
+                                    onChange={(e) => setPriority(e.target.value)}
+                                    className="flex-1 px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                                >
+                                    <option value="normal">Normal</option>
+                                    <option value="high">High Priority</option>
+                                </select>
                             </div>
+                        </div>
 
+                        <textarea
+                            placeholder="Broadcast content / message body..."
+                            value={body}
+                            onChange={(e) => setBody(e.target.value)}
+                            rows={3}
+                            required
+                            className="w-full px-3 py-2 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                        />
+
+                        <div className="flex items-center justify-end gap-2">
+                            <button
+                                type="button"
+                                onClick={() => setShowComposer(false)}
+                                className="px-3.5 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 hover:bg-slate-100"
+                            >
+                                Cancel
+                            </button>
                             <button
                                 type="submit"
-                                disabled={sending}
-                                className={`w-full py-4 px-6 rounded-2xl font-black text-sm uppercase tracking-[0.2em] transition-all flex items-center justify-center gap-3 relative overflow-hidden active:scale-95 ${sending ? 'bg-indigo-400' : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-2xl shadow-indigo-500/40 hover:-translate-y-1'}`}
+                                disabled={submitting}
+                                className="px-4 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm"
                             >
-                                {sending ? (
-                                    <>
-                                        <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                                        SYNCING SIGNAL...
-                                    </>
-                                ) : (
-                                    <>
-                                        ENGAGE MEGAPHONE
-                                        <Zap size={18} className="fill-current" />
-                                    </>
-                                )}
+                                {submitting ? 'Publishing...' : 'Publish Announcement'}
                             </button>
                         </div>
                     </form>
                 </div>
+            )}
 
-                {/* Broadcast Feed */}
-                <div className="xl:col-span-8 space-y-6">
-                    <div className="flex items-center justify-between mb-2">
-                        <h3 className="text-sm font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.3em] flex items-center gap-3">
-                            <Clock size={16} className="text-indigo-500" />
-                            Transmission Logs
-                        </h3>
-                        {announcements.length > 0 && (
-                            <span className="text-[10px] font-bold text-indigo-500 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-900/20 px-3 py-1 rounded-full uppercase italic">
-                                Total Feed: {announcements.length} Nodes
-                            </span>
-                        )}
+            {/* Announcements List */}
+            <div className="flex-1 overflow-y-auto p-3 sm:p-6 space-y-3 custom-scrollbar">
+                {loading && announcements.length === 0 ? (
+                    <div className="text-center py-12 text-slate-400 text-xs">Loading broadcasts...</div>
+                ) : announcements.length === 0 ? (
+                    <div className="text-center py-12 sm:py-16 text-slate-400">
+                        <CheckCircle2 size={36} className="mx-auto text-emerald-500 mb-2" />
+                        <p className="font-semibold text-slate-700 dark:text-slate-300">No Announcements</p>
+                        <p className="text-xs text-slate-400 mt-1">Click "New Announcement" to broadcast to all users.</p>
                     </div>
-
-                    {announcements.length === 0 ? (
-                        <div className="bg-white dark:bg-[#1f2937] p-24 text-center rounded-[2.5rem] border border-dashed border-gray-200 dark:border-gray-800">
-                            <div className="w-16 h-16 bg-gray-50 dark:bg-gray-800 rounded-full flex items-center justify-center mx-auto mb-6">
-                                <Megaphone className="text-gray-300" size={32} />
-                            </div>
-                            <p className="text-gray-400 font-bold uppercase tracking-widest text-sm">Static detected. No active signals.</p>
-                        </div>
-                    ) : (
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            {announcements.map((ann) => (
-                                <div key={ann.id} className={`group bg-white dark:bg-[#1f2937] border-2 rounded-[2rem] p-6 shadow-xl shadow-black/[0.02] transition-all hover:shadow-indigo-500/10 flex flex-col h-full relative overflow-hidden ${ann.active === false ? 'opacity-60 border-gray-200 dark:border-gray-800/50 grayscale-[0.5]' : 'border-transparent'}`}>
-
-                                    {/* Scanline Effect if Active */}
-                                    {ann.active !== false && (
-                                        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-indigo-500 to-transparent animate-[shimmer_3s_infinite]" />
-                                    )}
-
-                                    <div className="flex justify-between items-start mb-5 relative z-10">
-                                        <div className="flex flex-wrap gap-2">
-                                            <span className={`px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest border flex items-center gap-1.5 ${getTypeStyles(ann.type)}`}>
-                                                {getTypeIcon(ann.type)}
-                                                {ann.type}
+                ) : (
+                    announcements.map((item) => {
+                        const isSelected = selectedIds.has(item.id);
+                        return (
+                            <div
+                                key={item.id}
+                                className={`p-4 sm:p-5 bg-white dark:bg-slate-900 border rounded-2xl shadow-sm transition-all flex flex-col md:flex-row md:items-center justify-between gap-4 ${
+                                    isSelected
+                                        ? 'border-indigo-400 dark:border-indigo-600 bg-indigo-50/20'
+                                        : 'border-slate-200 dark:border-slate-800'
+                                }`}
+                            >
+                                <div className="flex items-start gap-3 min-w-0">
+                                    <input
+                                        type="checkbox"
+                                        checked={isSelected}
+                                        onChange={() => handleToggleSelect(item.id)}
+                                        className="mt-1 w-4 h-4 rounded text-indigo-600 border-slate-300 focus:ring-indigo-500 cursor-pointer shrink-0"
+                                    />
+                                    <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-2 flex-wrap">
+                                            <h4 className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">{item.title}</h4>
+                                            <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                                                item.type === 'alert'
+                                                    ? 'bg-rose-50 text-rose-600 dark:bg-rose-950/60'
+                                                    : item.type === 'warning'
+                                                    ? 'bg-amber-50 text-amber-600 dark:bg-amber-950/60'
+                                                    : 'bg-indigo-50 text-indigo-600 dark:bg-indigo-950/60'
+                                            }`}>
+                                                {item.type}
                                             </span>
-                                            {ann.priority === 'high' && (
-                                                <span className="bg-purple-500/10 text-purple-500 border border-purple-500/20 px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest animate-pulse">
-                                                    URGENT_PHASE
+                                            {item.is_active ? (
+                                                <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 dark:bg-emerald-950/60 px-2 py-0.5 rounded-full uppercase">
+                                                    Live
+                                                </span>
+                                            ) : (
+                                                <span className="text-[10px] font-bold text-slate-400 bg-slate-100 dark:bg-slate-800 px-2 py-0.5 rounded-full uppercase">
+                                                    Archived
                                                 </span>
                                             )}
-                                            {ann.active === false && (
-                                                <span className="bg-gray-500/10 text-gray-500 border border-gray-500/20 px-2.5 py-1 rounded-xl text-[9px] font-black uppercase tracking-widest">
-                                                    ARCHIVED
-                                                </span>
-                                            )}
                                         </div>
-                                        <span className="text-[10px] font-mono font-bold text-gray-400 tabular-nums">
-                                            {ann.timestamp?.toDate ? format(ann.timestamp.toDate(), 'yy.MM.dd | HH:mm') : 'PENDING...'}
-                                        </span>
-                                    </div>
-
-                                    <div className="flex-1 relative z-10">
-                                        <h4 className="font-extrabold text-gray-900 dark:text-gray-100 text-lg mb-2 tracking-tight line-clamp-2">{ann.title}</h4>
-                                        <p className="text-sm text-gray-500 dark:text-gray-400 font-medium leading-relaxed line-clamp-3">{ann.body}</p>
-                                    </div>
-
-                                    <div className="mt-6 pt-5 border-t border-gray-50 dark:border-gray-800/50 flex justify-between items-center relative z-10">
-                                        <div className="flex items-center gap-2">
-                                            <div className="w-6 h-6 rounded-full bg-indigo-50 dark:bg-indigo-900/30 flex items-center justify-center text-[10px] font-black text-indigo-500 border border-indigo-100 dark:border-indigo-800">
-                                                {ann.senderName?.charAt(0) || 'A'}
-                                            </div>
-                                            <span className="text-[10px] font-black text-gray-400 uppercase tracking-tighter">OP: {ann.senderName?.split(' ')[0] || 'ADMIN'}</span>
-                                        </div>
-
-                                        <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <button
-                                                onClick={() => handleToggleStatus(ann.id, ann.active)}
-                                                disabled={toggling === ann.id}
-                                                className={`p-2.5 rounded-xl transition-all active:scale-90 ${ann.active === false ? 'bg-indigo-50 dark:bg-indigo-900/20 text-indigo-500 hover:bg-indigo-100' : 'bg-gray-50 dark:bg-gray-800 text-gray-400 hover:text-amber-500 hover:bg-amber-50'}`}
-                                                title={ann.active === false ? "Re-activate Signal" : "Archive Signal"}
-                                            >
-                                                {toggling === ann.id ? (
-                                                    <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-                                                ) : ann.active === false ? <Zap size={16} /> : <Archive size={16} />}
-                                            </button>
-                                            <button
-                                                onClick={() => handleDelete(ann.id)}
-                                                disabled={toggling === ann.id}
-                                                className="p-2.5 bg-gray-50 dark:bg-gray-800 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all active:scale-90"
-                                                title="Hard Erase"
-                                            >
-                                                <Trash2 size={16} />
-                                            </button>
-                                        </div>
+                                        <p className="text-xs text-slate-600 dark:text-slate-300 mt-1 max-w-xl break-words">
+                                            {item.body}
+                                        </p>
+                                        <p className="text-[10px] text-slate-400 mt-2">
+                                            By {item.sender_name || 'System Admin'} • {item.created_at ? format(new Date(item.created_at), 'PPP') : '—'}
+                                        </p>
                                     </div>
                                 </div>
-                            ))}
-                        </div>
-                    )}
-                </div>
+
+                                <div className="flex items-center gap-2 self-end md:self-center shrink-0">
+                                    <button
+                                        onClick={() => handleToggleActive(item)}
+                                        className="p-2 rounded-xl border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300 transition-colors"
+                                        title={item.is_active ? 'Archive broadcast' : 'Activate broadcast'}
+                                    >
+                                        {item.is_active ? <EyeOff size={15} /> : <Eye size={15} />}
+                                    </button>
+                                    <button
+                                        onClick={() => handleDelete(item)}
+                                        className="p-2 rounded-xl border border-rose-200 text-rose-600 hover:bg-rose-50 dark:border-rose-900/50 dark:text-rose-400 transition-colors"
+                                        title="Delete broadcast"
+                                    >
+                                        <Trash2 size={15} />
+                                    </button>
+                                </div>
+                            </div>
+                        );
+                    })
+                )}
             </div>
+
+            <Pagination
+                page={page}
+                pageSize={pageSize}
+                totalCount={totalCount}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+                loading={loading}
+            />
+
+            <ConfirmModal
+                isOpen={confirmModal.isOpen}
+                title={confirmModal.title}
+                message={confirmModal.message}
+                confirmText={confirmModal.confirmText}
+                isDestructive={confirmModal.isDestructive}
+                onConfirm={confirmModal.onConfirm}
+                onCancel={() => setConfirmModal(prev => ({ ...prev, isOpen: false }))}
+            />
         </div>
     );
 };
 
 export default Announcements;
-

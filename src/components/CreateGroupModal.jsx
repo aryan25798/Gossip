@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from "react";
-import { db } from "../firebase";
-import { collection, addDoc, serverTimestamp, getDoc, doc, query, where, documentId, getDocs } from "firebase/firestore";
+import { supabase } from "../supabase";
 import { useAuth } from "../contexts/AuthContext";
 import { useFriend } from "../contexts/FriendContext";
+import { chatService } from "../services/chatService";
 import { FaTimes, FaCheck, FaSearch, FaUsers } from "react-icons/fa";
 import { Button } from "./ui/Button";
 import { Avatar } from "./ui/Avatar";
@@ -19,44 +19,30 @@ export default function CreateGroupModal({ onClose }) {
 
     useEffect(() => {
         const fetchFriendsData = async () => {
-            if (!friends || friends.length === 0) {
-                setLoading(false);
-                return;
-            }
-
+            const currentId = currentUser?.uid || currentUser?.id;
             try {
-                // Optimize: Chunked Queries to avoid N+1 reads
-                // Firestore 'in' query supports max 10 items.
-                const friendChunks = [];
-                for (let i = 0; i < friends.length; i += 10) {
-                    friendChunks.push(friends.slice(i, i + 10));
+                let query = supabase.from('users').select('id, display_name, email, avatar_url').neq('id', currentId).limit(50);
+                if (friends && friends.length > 0) {
+                    query = supabase.from('users').select('id, display_name, email, avatar_url').in('id', friends);
                 }
-
-                const friendsData = [];
-
-                // Process chunks
-                await Promise.all(friendChunks.map(async (chunk) => {
-                    if (chunk.length === 0) return;
-                    const q = query(
-                        collection(db, "users"),
-                        where(documentId(), 'in', chunk)
-                    );
-                    const querySnapshot = await getDocs(q);
-                    querySnapshot.forEach(doc => {
-                        friendsData.push({ id: doc.id, ...doc.data() });
-                    });
-                }));
-
-                setFriendList(friendsData);
+                const { data, error } = await query;
+                if (data && !error) {
+                    setFriendList(data.map(u => ({
+                        id: u.id,
+                        uid: u.id,
+                        displayName: u.display_name || u.email,
+                        photoURL: u.avatar_url
+                    })));
+                }
             } catch (error) {
-                console.error("Error fetching friends:", error);
+                console.error("Error fetching friends for group:", error);
             } finally {
                 setLoading(false);
             }
         };
 
         fetchFriendsData();
-    }, [friends]);
+    }, [friends, currentUser]);
 
     const handleSelectUser = (uid) => {
         if (selectedUsers.includes(uid)) {
@@ -68,144 +54,132 @@ export default function CreateGroupModal({ onClose }) {
 
     const createGroup = async () => {
         if (!groupName || selectedUsers.length === 0) return;
+        const currentUserId = currentUser.uid || currentUser.id;
 
         try {
-            const participants = [currentUser.uid, ...selectedUsers];
-            const chatRole = {
-                [currentUser.uid]: "admin"
-            };
-            selectedUsers.forEach(uid => chatRole[uid] = "member");
-
-            // Build participantInfo for faster lookup
-            const participantInfo = {
-                [currentUser.uid]: {
-                    displayName: currentUser.displayName,
-                    photoURL: currentUser.photoURL
-                }
-            };
-
-            selectedUsers.forEach(uid => {
-                const user = friendList.find(f => f.id === uid);
-                participantInfo[uid] = {
-                    displayName: user.displayName,
-                    photoURL: user.photoURL
-                };
-            });
-
-            await addDoc(collection(db, "chats"), {
-                type: "group",
-                groupName,
-                groupAdmin: currentUser.uid,
-                participants,
-                chatRole,
-                participantInfo,
-                lastMessage: { text: `${currentUser.displayName} created this group` },
-                lastMessageTimestamp: serverTimestamp(),
-                photoURL: "https://upload.wikimedia.org/wikipedia/commons/9/93/Google_Contacts_icon.svg" // Placeholder
-            });
-
+            await chatService.createGroupChat(groupName, selectedUsers, currentUserId);
             onClose();
         } catch (error) {
             console.error("Error creating group:", error);
         }
     };
 
-    const filteredFriends = friendList.filter(f =>
-        f.displayName?.toLowerCase().includes(searchTerm.toLowerCase())
+    const filteredFriends = friendList.filter(friend =>
+        friend.displayName?.toLowerCase().includes(searchTerm.toLowerCase())
     );
 
     return (
-        <div className="bg-background w-full max-w-md rounded-xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200">
-            {/* Header */}
-            <div className="bg-whatsapp-teal px-6 py-4 flex items-center justify-between text-white">
-                <div className="flex items-center gap-3">
-                    <FaUsers className="text-xl" />
-                    <h2 className="text-lg font-semibold">New Group</h2>
-                </div>
-                <button onClick={onClose} className="hover:bg-black/10 p-2 rounded-full transition-colors">
-                    <FaTimes />
-                </button>
-            </div>
-
-            <div className="p-6 space-y-6">
-                {/* Group Details */}
-                <div className="space-y-2">
-                    <label className="text-xs font-bold text-whatsapp-teal uppercase tracking-wider">Group Name</label>
-                    <Input
-                        placeholder="Enter group subject"
-                        value={groupName}
-                        onChange={(e) => setGroupName(e.target.value)}
-                        className="h-11 text-base border-0 border-b-2 border-muted focus-visible:ring-0 focus-visible:border-whatsapp-teal rounded-none px-0 transition-all bg-transparent"
-                    />
-                </div>
-
-                {/* Participant Selection */}
-                <div className="space-y-3">
-                    <div className="flex items-center justify-between">
-                        <label className="text-xs font-bold text-muted-foreground uppercase tracking-wider">
-                            Add Friends ({selectedUsers.length})
-                        </label>
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fade-in">
+            <div className="bg-surface border border-border w-full max-w-md rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+                {/* Header */}
+                <div className="flex items-center justify-between p-4 border-b border-border bg-surface-elevated">
+                    <div className="flex items-center gap-2">
+                        <FaUsers className="text-primary text-xl" />
+                        <h2 className="text-lg font-semibold text-text-1">Create Group</h2>
                     </div>
+                    <Button variant="ghost" size="icon" onClick={onClose} className="text-text-2 hover:text-text-1 rounded-full">
+                        <FaTimes />
+                    </Button>
+                </div>
 
-                    <div className="relative">
-                        <FaSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground text-sm" />
+                {/* Body */}
+                <div className="p-4 flex flex-col gap-4 overflow-y-auto">
+                    {/* Group Name Input */}
+                    <div>
+                        <label className="text-xs font-semibold text-text-2 uppercase tracking-wider block mb-2">Group Subject</label>
                         <Input
-                            placeholder="Search friends"
-                            className="h-9 pl-9 bg-muted border-none rounded-lg text-sm"
-                            value={searchTerm}
-                            onChange={(e) => setSearchTerm(e.target.value)}
+                            placeholder="Type group subject here..."
+                            value={groupName}
+                            onChange={(e) => setGroupName(e.target.value)}
+                            className="w-full"
+                            maxLength={50}
                         />
                     </div>
 
-                    <div className="max-h-[300px] overflow-y-auto custom-scrollbar space-y-1 pr-1">
-                        {loading ? (
-                            <div className="py-10 text-center text-muted-foreground italic text-sm">
-                                Loading friends...
+                    {/* Selected Users Chips */}
+                    {selectedUsers.length > 0 && (
+                        <div>
+                            <label className="text-xs font-semibold text-text-2 uppercase tracking-wider block mb-2">
+                                Selected ({selectedUsers.length})
+                            </label>
+                            <div className="flex flex-wrap gap-2">
+                                {selectedUsers.map(uid => {
+                                    const user = friendList.find(f => f.id === uid);
+                                    return (
+                                        <div key={uid} className="flex items-center gap-1 bg-surface-elevated border border-border text-xs px-2 py-1 rounded-full text-text-1">
+                                            <Avatar src={user?.photoURL} alt={user?.displayName} size="xs" />
+                                            <span className="truncate max-w-[100px]">{user?.displayName}</span>
+                                            <button onClick={() => handleSelectUser(uid)} className="hover:text-red-500 ml-1">
+                                                <FaTimes size={10} />
+                                            </button>
+                                        </div>
+                                    );
+                                })}
                             </div>
-                        ) : filteredFriends.length === 0 ? (
-                            <div className="py-10 text-center text-muted-foreground italic text-sm">
-                                {searchTerm ? "No friends found matching search" : "No friends found to add"}
-                            </div>
-                        ) : (
-                            filteredFriends.map(friend => (
-                                <div
-                                    key={friend.id}
-                                    className={`flex items-center gap-4 p-2 rounded-lg cursor-pointer transition-colors ${selectedUsers.includes(friend.id) ? 'bg-whatsapp-teal/10' : 'hover:bg-muted'
-                                        }`}
-                                    onClick={() => handleSelectUser(friend.id)}
-                                >
-                                    <div className="relative">
-                                        <Avatar src={friend.photoURL} alt={friend.displayName} size="md" />
-                                        {selectedUsers.includes(friend.id) && (
-                                            <div className="absolute -bottom-1 -right-1 bg-whatsapp-teal text-white rounded-full p-0.5 border-2 border-background">
-                                                <FaCheck className="w-2 h-2" />
-                                            </div>
-                                        )}
-                                    </div>
-                                    <div className="flex-1 min-w-0">
-                                        <p className="font-semibold text-foreground truncate">{friend.displayName}</p>
-                                        <p className="text-xs text-muted-foreground truncate italic">{friend.bio || "Available"}</p>
-                                    </div>
+                        </div>
+                    )}
+
+                    {/* Friends Search */}
+                    <div>
+                        <label className="text-xs font-semibold text-text-2 uppercase tracking-wider block mb-2">Add Participants</label>
+                        <div className="relative mb-2">
+                            <FaSearch className="absolute left-3 top-3 text-text-2 text-sm" />
+                            <Input
+                                placeholder="Search contacts..."
+                                value={searchTerm}
+                                onChange={(e) => setSearchTerm(e.target.value)}
+                                className="pl-9 w-full"
+                            />
+                        </div>
+
+                        {/* List */}
+                        <div className="flex flex-col gap-1 max-h-48 overflow-y-auto custom-scrollbar border border-border rounded-xl p-1 bg-background">
+                            {loading ? (
+                                <div className="text-center py-6 text-text-2 text-sm">
+                                    Loading contacts...
                                 </div>
-                            ))
-                        )}
+                            ) : filteredFriends.length === 0 ? (
+                                <div className="text-center py-6 text-text-2 text-sm">
+                                    No contacts found
+                                </div>
+                            ) : (
+                                filteredFriends.map(friend => {
+                                    const isSelected = selectedUsers.includes(friend.id);
+                                    return (
+                                        <div
+                                            key={friend.id}
+                                            onClick={() => handleSelectUser(friend.id)}
+                                            className={`flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors ${isSelected ? 'bg-primary/10 border border-primary/20' : 'hover:bg-surface-elevated'}`}
+                                        >
+                                            <div className="flex items-center gap-3">
+                                                <Avatar src={friend.photoURL} alt={friend.displayName} size="sm" />
+                                                <span className="text-sm font-medium text-text-1">{friend.displayName}</span>
+                                            </div>
+                                            <div className={`w-5 h-5 rounded border flex items-center justify-center transition-colors ${isSelected ? 'bg-primary border-primary text-white' : 'border-border'}`}>
+                                                {isSelected && <FaCheck size={10} />}
+                                            </div>
+                                        </div>
+                                    );
+                                })
+                            )}
+                        </div>
                     </div>
                 </div>
-            </div>
 
-            {/* Footer */}
-            <div className="px-6 py-4 bg-muted/30 border-t border-border flex justify-end gap-3">
-                <Button variant="ghost" onClick={onClose}>Cancel</Button>
-                <Button
-                    variant="primary"
-                    className="bg-whatsapp-teal hover:bg-whatsapp-dark text-white rounded-full px-8"
-                    onClick={createGroup}
-                    disabled={!groupName || selectedUsers.length === 0}
-                >
-                    Create Group
-                </Button>
+                {/* Footer */}
+                <div className="p-4 border-t border-border bg-surface-elevated flex justify-end gap-2">
+                    <Button variant="ghost" onClick={onClose}>
+                        Cancel
+                    </Button>
+                    <Button
+                        onClick={createGroup}
+                        disabled={!groupName.trim() || selectedUsers.length === 0}
+                        className="bg-primary hover:bg-primary/90 text-white"
+                    >
+                        Create Group
+                    </Button>
+                </div>
             </div>
         </div>
     );
 }
-

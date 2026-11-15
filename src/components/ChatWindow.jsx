@@ -1,9 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { FaTimes, FaSearch, FaVideo, FaPhone, FaEllipsisV } from "react-icons/fa";
+import { v4 as uuidv4 } from "uuid";
 import { GEMINI_BOT_ID } from "../constants";
 
-import { db } from "../firebase";
-import { doc, collection, getDoc } from "firebase/firestore";
 
 import { useAuth } from "../contexts/AuthContext";
 import { useCall } from "../contexts/CallContext";
@@ -13,8 +12,6 @@ import { sendMediaMessage, deleteMessage, addReaction, searchMessages, clearChat
 import { usePresence } from "../contexts/PresenceContext";
 import { motion, AnimatePresence } from "framer-motion";
 import { useFileUpload } from "../contexts/FileUploadContext";
-import { getDownloadURL, ref, uploadBytesResumable } from "firebase/storage";
-import { storage } from "../firebase";
 
 import { useFriend } from "../contexts/FriendContext";
 import { Button } from "./ui/Button";
@@ -158,24 +155,25 @@ export default function ChatWindow({ chat, setChat }) {
 
     const handleDelete = useCallback(async (msgId, mode) => {
         try {
-            await deleteMessage(chat.id, msgId, mode);
+            await deleteMessage(chat.id, msgId, mode, currentUser?.uid || currentUser?.id);
         } catch (error) {
             console.error("Delete failed", error);
         }
-    }, [chat?.id]);
+    }, [chat?.id, currentUser]);
 
     const handleReact = useCallback(async (msgId, emoji) => {
         try {
-            await addReaction(chat.id, msgId, emoji, currentUser.uid);
+            await addReaction(chat.id, msgId, emoji, currentUser?.uid || currentUser?.id);
         } catch (error) {
             console.error("React failed", error);
         }
-    }, [chat?.id, currentUser.uid]);
+    }, [chat?.id, currentUser]);
+
+    const { startUpload, cancelUpload } = useFileUpload();
 
     const handleCancelUpload = useCallback((uploadId) => {
-        // Placeholder for upload cancellation context logic
-        console.log("Cancel upload", uploadId);
-    }, []);
+        if (cancelUpload) cancelUpload(uploadId);
+    }, [cancelUpload]);
 
     const handleFileUpload = useCallback((e) => {
         const file = e.target?.files?.[0];
@@ -184,8 +182,6 @@ export default function ChatWindow({ chat, setChat }) {
         setShowMediaPreview(true);
     }, []);
 
-    const { startUpload } = useFileUpload();
-
     const handleSendStagedFile = useCallback(async (file, caption) => {
         setShowMediaPreview(false);
         setStagedFile(null);
@@ -193,28 +189,25 @@ export default function ChatWindow({ chat, setChat }) {
         if (!chat?.id || !currentUser) return;
 
         try {
-            const storagePath = `uploads/${chat.id}/${Date.now()}_${file.name}`;
-            const { uploadId, uploadTask } = await startUpload(file, storagePath, {
-                contentType: file.type
+            const ext = file.name.split('.').pop() || 'dat';
+            const storagePath = `chat_media/${chat.id}/${Date.now()}_${uuidv4()}.${ext}`;
+
+            // Upload via TUS resumable upload manager with real progress
+            const { result } = await startUpload(file, storagePath, {
+                bucket: 'novachat-media'
             });
 
-            // Listen for completion to send the final message
-            uploadTask.then(async (snapshot) => {
-                const downloadURL = await getDownloadURL(snapshot.ref);
-                await sendMediaMessage(chat.id, currentUser, {
-                    url: downloadURL,
-                    fileName: file.name,
-                    fileSize: file.size,
-                    fileType: file.type,
-                    width: file.width,
-                    height: file.height
-                });
-            }).catch(err => {
-                console.error("Upload failed in ChatWindow:", err);
+            // Once uploaded and verified, save message in PostgreSQL
+            await sendMediaMessage(chat.id, currentUser, {
+                url: result.publicUrl,
+                fileName: result.fileName,
+                fileSize: result.size,
+                fileType: result.mimeType,
+                caption: caption || ''
             });
-
         } catch (e) {
             console.error("Media send error:", e);
+            alert(`Upload failed: ${e.message || 'Check your connection'}`);
         }
     }, [chat?.id, currentUser, startUpload]);
 
@@ -301,10 +294,10 @@ export default function ChatWindow({ chat, setChat }) {
         return 'image';
     };
 
-    const { getFriendStatus, loading: friendsLoading } = useFriend();
+    const { getFriendStatus, loading: friendsLoading } = useFriend() || {};
     const friendStatus = useMemo(() => {
         if (!otherUser?.uid || friendsLoading) return 'friend'; // Default to assuming friend during quick loads to prevent flicker
-        return getFriendStatus(otherUser.uid);
+        return typeof getFriendStatus === 'function' ? getFriendStatus(otherUser.uid) : 'friend';
     }, [otherUser?.uid, getFriendStatus, friendsLoading]);
 
     const canMessage = otherUser.isGroup || friendStatus === 'friend' || otherUser.isGemini;
@@ -439,6 +432,9 @@ export default function ChatWindow({ chat, setChat }) {
                     onMediaClick={handleMediaClick}
                     rtdbStatus={rtdbStatus}
                     onCancelUpload={handleCancelUpload}
+                    handleLoadMore={handleLoadMore}
+                    loadingHistory={loadingHistory}
+                    hasMoreMessages={hasMoreMessages}
                 />
             </div>
 

@@ -1,14 +1,13 @@
 import React, { useState, useRef } from "react";
 import { useAuth } from "../contexts/AuthContext";
 import { updateUserProfile, uploadProfilePhoto } from "../services/authService";
-import { db } from "../firebase";
-import { doc, updateDoc } from "firebase/firestore";
+import { supabase } from "../supabase";
 import { FaArrowLeft, FaCamera, FaPen, FaCheck, FaSignOutAlt, FaBell } from "react-icons/fa";
 import { motion } from "framer-motion";
 import { useNotification } from "../contexts/NotificationContext";
 
 export default function ProfileSettings({ onClose }) {
-    const { currentUser, logout, toggleLocationSharing } = useAuth();
+    const { currentUser, logout, toggleLocationSharing, updateProfileState } = useAuth();
     const { requestPermission } = useNotification();
     const [name, setName] = useState(currentUser.displayName || "");
     const [about, setAbout] = useState(currentUser.about || "Hey there! I am using WhatsClone AI.");
@@ -23,9 +22,10 @@ export default function ProfileSettings({ onClose }) {
 
     const updatePrivacy = async (field, value) => {
         try {
-            await updateDoc(doc(db, "users", currentUser.uid), {
-                [`privacy.${field}`]: value
-            });
+            const userId = currentUser.uid || currentUser.id;
+            await supabase.from('users').update({
+                about_status: value
+            }).eq('id', userId);
             if (field === 'lastSeen') setLastSeenPrivacy(value);
             if (field === 'readReceipts') setReadReceipts(value);
         } catch (err) { console.error("Privacy update failed", err); }
@@ -59,6 +59,7 @@ export default function ProfileSettings({ onClose }) {
         try {
             const url = await uploadProfilePhoto(currentUser.uid, file);
             setPhotoURL(url);
+            if (updateProfileState) updateProfileState({ photoURL: url });
         } catch (err) {
             console.error("Error uploading photo:", err);
         }

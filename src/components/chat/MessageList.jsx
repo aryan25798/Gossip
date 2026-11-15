@@ -14,8 +14,11 @@ export function MessageList({
     messagesEndRef,
     loading,
     onMediaClick,
-    rtdbStatus, // [OPT] Received from parent
-    onCancelUpload
+    rtdbStatus,
+    onCancelUpload,
+    handleLoadMore,
+    loadingHistory,
+    hasMoreMessages
 }) {
     const virtuosoRef = useRef(null);
 
@@ -107,12 +110,18 @@ export function MessageList({
                     followOutput={(isAtBottom) => isAtBottom ? "auto" : false}
                     alignToBottom={true}
                     defaultItemHeight={72}
-                    increaseViewportBy={200} // Reduced for performance
+                    increaseViewportBy={200}
                     atBottomThreshold={200}
-                    overscan={{ main: 200, reverse: 200 }} // Reduced to save memory
+                    overscan={{ main: 200, reverse: 200 }}
+                    startReached={hasMoreMessages && !loadingHistory && handleLoadMore ? handleLoadMore : undefined}
                     components={{
                         Footer: () => <div className="h-4 w-full invisible" />,
-                        Header: () => <div className="h-4 w-full invisible" />
+                        Header: () => loadingHistory ? (
+                            <div className="py-2.5 flex justify-center items-center gap-2 text-xs text-text-2 bg-surface/30">
+                                <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                                <span>Loading older messages...</span>
+                            </div>
+                        ) : <div className="h-2 w-full invisible" />
                     }}
                 />
             )}

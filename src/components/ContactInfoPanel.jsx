@@ -2,9 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { summarizeChat } from '../services/AIAgentService';
 import { FaTimes, FaBell, FaBellSlash, FaTrash, FaChevronRight, FaStar, FaShieldAlt, FaFileAlt, FaExternalLinkAlt, FaEnvelope, FaBan, FaArrowLeft, FaPhone, FaUserMinus, FaUserPlus, FaUserClock, FaUserCheck, FaSignOutAlt, FaCrown, FaSearch } from 'react-icons/fa';
 import { motion, AnimatePresence } from 'framer-motion';
-import { db, storage } from '../firebase';
-import { collection, query, onSnapshot, orderBy, doc, deleteDoc, writeBatch, getDocs, getDoc } from 'firebase/firestore';
-import { ref, deleteObject } from "firebase/storage";
+import { supabase } from '../supabase';
 import { listenerManager } from '../utils/ListenerManager';
 import { clearChat, toggleMuteChat } from '../services/chatService';
 import { blockUser, unblockUser } from '../services/userService';
@@ -55,44 +53,51 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     const [isSummarizing, setIsSummarizing] = useState(false);
 
     useEffect(() => {
-        if (!chat?.id) return;
+        if (!chat?.id || !isOpen) return;
 
-        const q = query(
-            collection(db, "chats", chat.id, "messages"),
-            orderBy("timestamp", "desc")
-        );
+        let isMounted = true;
+        const fetchMedia = async () => {
+            const { data: messages } = await supabase
+                .from('messages')
+                .select('*')
+                .eq('conversation_id', chat.id)
+                .order('created_at', { ascending: false });
 
-        const listenerKey = `contact-info-${chat.id}`;
+            if (!isMounted || !messages) return;
 
-        const unsubscribe = onSnapshot(q, (snapshot) => {
             const items = { media: [], links: [], docs: [] };
             const msgs = [];
             const urlRegex = /(https?:\/\/[^\s]+)/g;
 
-            snapshot.docs.forEach(doc => {
-                const data = doc.data();
+            messages.forEach(m => {
+                const data = {
+                    id: m.id,
+                    text: m.content,
+                    type: m.message_type,
+                    fileUrl: m.media_url,
+                    timestamp: m.created_at
+                };
                 msgs.push(data);
                 if (data.type === 'image' || data.type === 'video') {
-                    items.media.push({ id: doc.id, ...data });
-                } else if (data.mediaType === 'file' || data.type === 'file' || data.type === 'pdf') {
-                    items.docs.push({ id: doc.id, ...data });
+                    items.media.push(data);
+                } else if (data.type === 'file' || data.type === 'pdf') {
+                    items.docs.push(data);
                 } else if (data.text && data.text.match(urlRegex)) {
                     const linksMatched = data.text.match(urlRegex);
                     linksMatched.forEach(link => {
-                        items.links.push({ id: doc.id, url: link, ...data });
+                        items.links.push({ ...data, url: link });
                     });
                 }
             });
+
             setMediaItems(items);
             setAllMessages(msgs);
-        }, (error) => {
-            listenerManager.handleListenerError(error, 'ContactInfoMessages');
-        });
+        };
 
-        listenerManager.subscribe(listenerKey, unsubscribe);
+        fetchMedia();
 
         return () => {
-            listenerManager.unsubscribe(listenerKey);
+            isMounted = false;
         };
     }, [chat?.id, isOpen]);
 
@@ -218,38 +223,13 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     };
 
     const handleDeleteChat = async () => {
-        if (window.confirm("⚠️ NUKE WARNING: This will permanently delete this chat and ALL media files for everyone. This action cannot be undone. Are you sure?")) {
+        if (window.confirm("⚠️ WARNING: This will permanently delete this chat and all messages. Are you sure?")) {
             try {
-                const messagesRef = collection(db, "chats", chat.id, "messages");
-                const snapshot = await getDocs(messagesRef);
-
-                // 1. Delete All Storage Files (Cleanup Orphans)
-                const storagePromises = snapshot.docs.map(async (doc) => {
-                    const data = doc.data();
-                    const url = data.fileUrl || data.imageUrl || data.videoUrl || data.audioUrl;
-                    if (url) {
-                        try {
-                            const fileRef = ref(storage, url);
-                            await deleteObject(fileRef);
-                            console.log("Nuked file:", url);
-                        } catch (e) {
-                            console.warn("Failed to nuke file (already gone?):", e);
-                        }
-                    }
-                });
-                await Promise.all(storagePromises);
-
-                // 2. Delete All Messages from Firestore
-                const batch = writeBatch(db);
-                snapshot.docs.forEach((mDoc) => batch.delete(mDoc.ref));
-                await batch.commit();
-
-                // 3. Delete Chat Document
-                await deleteDoc(doc(db, "chats", chat.id));
+                await supabase.from('conversations').delete().eq('id', chat.id);
                 onClose();
             } catch (err) {
-                console.error("Error nuke-deleting chat:", err);
-                alert("Failed to delete chat completely. Check console.");
+                console.error("Error deleting chat:", err);
+                alert("Failed to delete chat.");
             }
         }
     };

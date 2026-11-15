@@ -308,16 +308,13 @@ const ContactsPage = () => {
                         onClick={async () => {
                             if (window.confirm("⚠️ DANGER ZONE ⚠️\n\nThis will delete ALL users, chats, and messages (except your account).\n\nAre you sure you want to RESET THE APP?")) {
                                 if (window.confirm("Really? There is no undo.")) {
-                                    const { httpsCallable, getFunctions } = await import('firebase/functions');
-                                    const functions = getFunctions();
-                                    const debugResetApp = httpsCallable(functions, 'debugResetApp');
-
                                     const toast = (await import('react-hot-toast')).default;
-                                    const toastId = toast.loading("Reseting App... Do not close.");
-
+                                    const toastId = toast.loading("Resetting data...");
                                     try {
-                                        await debugResetApp();
-                                        toast.success("App Reset Complete!", { id: toastId });
+                                        const { supabase } = await import('../supabase');
+                                        await supabase.from('messages').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+                                        await supabase.from('conversations').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+                                        toast.success("Reset Complete!", { id: toastId });
                                         window.location.reload();
                                     } catch (e) {
                                         toast.error("Reset Failed: " + e.message, { id: toastId });

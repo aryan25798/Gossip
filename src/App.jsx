@@ -25,8 +25,9 @@ const SharePage = lazy(() => import('./pages/SharePage'));
 import Loading from './components/ui/Loading';
 
 function PrivateRoute({ children }) {
-  const { currentUser } = useAuth();
-  if (!currentUser) return <Navigate to="/login" />;
+  const { currentUser, loading } = useAuth();
+  if (loading) return <Loading />;
+  if (!currentUser) return <Navigate to="/login" replace />;
   return children;
 }
 
@@ -116,19 +117,12 @@ const UserShell = React.memo(() => (
 ));
 
 const RootGate = () => {
-  const { currentUser } = useAuth();
-  const navigate = useNavigate();
+  const { currentUser, loading } = useAuth();
 
-  // If claims are not settled, we wait (Crucial for role resolution)
-  // FALLBACK: If we have a user but claims are taking too long, we show loading but 
-  // AuthContext now has a 5s safety trigger to auto-settle them.
-  if (!currentUser) return <Login />;
+  if (loading) return <Loading />;
+  if (!currentUser) return <Navigate to="/login" replace />;
 
-  if (!currentUser.claimsSettled) {
-    return <Loading />;
-  }
-
-  const isAdmin = !!currentUser.isAdmin || !!currentUser.superAdmin;
+  const isAdmin = currentUser.role === 'admin' || currentUser.role === 'superAdmin' || !!currentUser.isAdmin || !!currentUser.superAdmin;
   console.debug("[RootGate] Selecting Shell. isAdmin:", isAdmin, "email:", currentUser.email);
 
   return isAdmin ? <AdminShell /> : <UserShell />;

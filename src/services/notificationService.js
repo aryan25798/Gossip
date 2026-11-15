@@ -1,89 +1,92 @@
-import { db } from '../firebase';
-import { collection, addDoc, query, where, orderBy, onSnapshot, updateDoc, doc, serverTimestamp, limit } from 'firebase/firestore';
-import { auth } from '../firebase';
-import { listenerManager } from '../utils/ListenerManager';
+import { supabase } from '../supabase';
 
-// Collection reference
-const NOTIFICATIONS_COLLECTION = 'notifications';
+export const notificationService = {
+    // 1. Get paginated notifications
+    getNotificationsPaginated: async (userId, { page = 1, pageSize = 20, unreadOnly = false }) => {
+        if (!userId) return { notifications: [], totalCount: 0, unreadCount: 0, page, pageSize, totalPages: 1 };
 
-/**
- * Sends a notification to a specific user.
- * @param {string} toUserId - ID of the user receiving the notification.
- * @param {string} type - Type of notification (e.g., 'message', 'friend_request', 'call', 'system').
- * @param {string} title - Notification title.
- * @param {string} body - Notification body content.
- * @param {object} data - Additional data (e.g., senderId, chatId, callId).
- */
-export const sendNotification = async (toUserId, type, title, body, data = {}) => {
-    try {
-        const currentUser = auth.currentUser;
-        if (!currentUser) throw new Error('User must be authenticated to send notifications');
+        const from = (page - 1) * pageSize;
+        const to = from + pageSize - 1;
 
-        await addDoc(collection(db, NOTIFICATIONS_COLLECTION), {
-            toUserId,
-            fromUserId: currentUser.uid,
-            type,
-            title,
-            body,
-            data,
-            isRead: false,
-            createdAt: serverTimestamp(),
-        });
-    } catch (error) {
-        console.error("Error sending notification:", error);
-        throw error;
-    }
-};
+        let query = supabase
+            .from('notifications')
+            .select('*', { count: 'exact' })
+            .eq('user_id', userId);
 
-/**
- * Marks a notification as read.
- * @param {string} notificationId 
- */
-export const markNotificationAsRead = async (notificationId) => {
-    try {
-        const notifRef = doc(db, NOTIFICATIONS_COLLECTION, notificationId);
-        await updateDoc(notifRef, { isRead: true });
-    } catch (error) {
-        console.error("Error marking notification as read:", error);
-    }
-};
-
-/**
- * Subscribes to the user's notifications.
- * @param {string} userId 
- * @param {function} callback 
- * @returns {function} Unsubscribe function
- */
-export const subscribeToNotifications = (userId, callback) => {
-    if (!userId) return () => { };
-
-    const q = query(
-        collection(db, NOTIFICATIONS_COLLECTION),
-        where('toUserId', '==', userId),
-        orderBy('createdAt', 'desc'),
-        limit(50)
-    );
-
-    const listenerKey = `notifications-${userId}`;
-
-    const unsubscribe = onSnapshot(q,
-        (snapshot) => {
-            const notifications = snapshot.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data()
-            }));
-            callback(notifications);
-        },
-        (error) => {
-            listenerManager.handleListenerError(error, 'Notifications');
-            callback([]);
+        if (unreadOnly) {
+            query = query.eq('is_read', false);
         }
-    );
 
-    listenerManager.subscribe(listenerKey, unsubscribe);
+        query = query.order('created_at', { ascending: false }).range(from, to);
 
-    return () => {
-        listenerManager.unsubscribe(listenerKey);
-    };
+        const { data, count, error } = await query;
+        if (error) {
+            console.error('[notificationService] Paginated fetch error:', error);
+            return { notifications: [], totalCount: 0, unreadCount: 0, page, pageSize, totalPages: 1 };
+        }
+
+        // Also get unread count
+        const { count: unreadCount } = await supabase
+            .from('notifications')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_id', userId)
+            .eq('is_read', false);
+
+        return {
+            notifications: data || [],
+            totalCount: count || 0,
+            unreadCount: unreadCount || 0,
+            page,
+            pageSize,
+            totalPages: Math.max(1, Math.ceil((count || 0) / pageSize))
+        };
+    },
+
+    // 2. Mark notification as read
+    markAsRead: async (notificationId) => {
+        return supabase.from('notifications').update({ is_read: true }).eq('id', notificationId);
+    },
+
+    // 3. Mark all as read
+    markAllAsRead: async (userId) => {
+        return supabase.from('notifications').update({ is_read: true }).eq('user_id', userId);
+    },
+
+    // 4. Delete notification
+    deleteNotification: async (notificationId) => {
+        return supabase.from('notifications').delete().eq('id', notificationId);
+    },
+
+    // 5. Bulk delete notifications
+    bulkDeleteNotifications: async (ids = []) => {
+        if (!ids.length) return;
+        return supabase.from('notifications').delete().in('id', ids);
+    },
+
+    // 6. Subscribe to real-time notifications
+    subscribeToNotifications: (userId, onNewNotification) => {
+        if (!userId) return () => {};
+
+        const channel = supabase
+            .channel(`user_notifications_${userId}`)
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'notifications',
+                    filter: `user_id=eq.${userId}`
+                },
+                (payload) => {
+                    onNewNotification(payload.new);
+                }
+            )
+            .subscribe();
+
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }
 };
 
+export default notificationService;

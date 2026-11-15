@@ -1,11 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { db, auth, functions } from '../../firebase';
-import { collection, query, orderBy, limit, onSnapshot, doc, getDoc, deleteDoc } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
+import { adminService } from '../../services/adminService';
+import { supabase } from '../../supabase';
 import { format } from 'date-fns';
 import { FaTrash, FaEyeSlash, FaSearch, FaUserShield, FaExternalLinkAlt, FaFileAlt, FaDownload } from 'react-icons/fa';
 import { Search, ShieldAlert, User, MoreHorizontal, Info, X } from 'lucide-react';
-import { lightningSync } from '../../services/LightningService';
 import { VideoPlayer } from '../ui/VideoPlayer';
 import { downloadMedia } from '../../utils/downloadHelper';
 
@@ -24,69 +22,60 @@ const SpyChatViewer = ({ chatId, onClose, onOpenDossier, sharedParticipants = {}
     useEffect(() => {
         if (!chatId) return;
 
-        const fetchMetadata = async () => {
+        const loadChatIntel = async () => {
             setError(null);
             try {
-                const chatSnap = await getDoc(doc(db, 'chats', chatId));
-                if (chatSnap.exists()) {
-                    const data = chatSnap.data();
-                    setChatData(data);
-
+                const res = await adminService.getChatMessages(chatId, limitCount);
+                if (res) {
+                    setChatData(res.conversation);
                     const pMap = { ...sharedParticipants };
-                    const pList = data.participants || [];
-
-                    // Only fetch profiles not in the shared cache
-                    const missingProfiles = pList.filter(uid => !pMap[uid]);
-
-                    if (missingProfiles.length > 0) {
-                        await Promise.all(missingProfiles.map(async (uid) => {
-                            const uSnap = await getDoc(doc(db, 'users', uid));
-                            if (uSnap.exists()) {
-                                pMap[uid] = uSnap.data();
-                            } else {
-                                pMap[uid] = { uid, displayName: 'External/Deleted' };
-                            }
-                        }));
-                    }
+                    (res.participants || []).forEach(p => {
+                        pMap[p.id] = { uid: p.id, displayName: p.display_name, photoURL: p.avatar_url, email: p.email };
+                    });
                     setParticipants(pMap);
+                    setMessages(res.messages || []);
+                    setHasMore((res.messages || []).length >= limitCount);
+
+                    if (limitCount === 50) {
+                        setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+                    }
                 }
             } catch (err) {
-                console.error("Metadata Load Error:", err);
-                if (err.code === 'permission-denied') setError('PERMISSION_DENIED');
+                console.error("Spy Chat Intel Load Error:", err);
+                if (err.status === 403) setError('PERMISSION_DENIED');
             }
         };
-        fetchMetadata();
 
-        // INDUSTRY GRADE: Limit initial load for performance
-        const q = query(
-            collection(db, 'chats', chatId, 'messages'),
-            orderBy('timestamp', 'desc'),
-            limit(limitCount)
-        );
+        loadChatIntel();
 
-        const unsubscribe = onSnapshot(q, (snapshot) => {
-            const msgs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })).reverse();
-            setMessages(msgs);
-            setHasMore(snapshot.docs.length >= limitCount);
-
-            // Only auto-scroll on initial load or small updates
-            if (limitCount === 50) {
-                setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
-            }
-        }, (err) => {
-            console.error("Signal Subscription Error:", err);
-            if (err.code === 'permission-denied') setError('PERMISSION_DENIED');
-        });
-
-        const unsubscribeTyping = lightningSync.subscribeToTyping(chatId, (uids) => {
-            const typingData = {};
-            uids.forEach(uid => { typingData[uid] = true; });
-            setTypingUsers(typingData);
-        });
+        // Real-time updates via Supabase channel
+        const channel = supabase
+            .channel(`spy_chat_${chatId}`)
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'messages',
+                    filter: `conversation_id=eq.${chatId}`
+                },
+                (payload) => {
+                    const newMsg = {
+                        id: payload.new.id,
+                        senderId: payload.new.sender_id,
+                        text: payload.new.content,
+                        type: payload.new.message_type,
+                        fileUrl: payload.new.media_url,
+                        timestamp: payload.new.created_at
+                    };
+                    setMessages(prev => [...prev, newMsg]);
+                    setTimeout(() => messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 100);
+                }
+            )
+            .subscribe();
 
         return () => {
-            unsubscribe();
-            unsubscribeTyping();
+            supabase.removeChannel(channel);
         };
     }, [chatId, limitCount]);
 
@@ -95,10 +84,10 @@ const SpyChatViewer = ({ chatId, onClose, onOpenDossier, sharedParticipants = {}
     };
 
     const hardDeleteMessage = async (msgId) => {
-        if (!window.confirm("CRITICAL ACTION: Permanently erase this message and associated media from the database and storage? This cannot be undone.")) return;
+        if (!window.confirm("CRITICAL ACTION: Permanently erase this message from the database? This cannot be undone.")) return;
         try {
-            const deleteMsgFn = httpsCallable(functions, 'adminHardDeleteMessage');
-            await deleteMsgFn({ chatId, messageId: msgId });
+            await adminService.hardDeleteMessage(msgId);
+            setMessages(prev => prev.filter(m => m.id !== msgId));
         } catch (err) {
             alert("Hard Delete Failed: " + err.message);
         }
@@ -111,8 +100,7 @@ const SpyChatViewer = ({ chatId, onClose, onOpenDossier, sharedParticipants = {}
     const hardDeleteChat = async () => {
         if (!window.confirm("NUCLEAR OPTION: This will permanently delete this entire chat and all associated messages for ALL users. This action is irreversible. Continue?")) return;
         try {
-            const deleteChatFn = httpsCallable(functions, 'adminDeleteChat');
-            await deleteChatFn({ chatId });
+            await adminService.hardDeleteChat(chatId);
             alert("Chat permanently erased.");
             onClose();
         } catch (err) {

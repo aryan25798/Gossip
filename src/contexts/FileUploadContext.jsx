@@ -1,260 +1,93 @@
-import React, { createContext, useContext, useState, useCallback, useRef, useMemo } from 'react';
-import { storage } from '../firebase';
-import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
-import { v4 as uuidv4 } from 'uuid';
-import imageCompression from 'browser-image-compression';
+import React, { createContext, useContext, useState, useCallback, useMemo } from 'react';
+import { uploadManager } from '../services/uploadManager';
 
 const FileUploadContext = createContext();
 
-export const useFileUpload = () => useContext(FileUploadContext);
+export function useFileUpload() {
+    return useContext(FileUploadContext);
+}
 
-export const FileUploadProvider = ({ children }) => {
+export function FileUploadProvider({ children }) {
     const [uploads, setUploads] = useState({});
-    const uploadTasksRef = useRef({});
 
-    const startUpload = useCallback(async (file, path, metadata = {}, uploadId = uuidv4()) => {
-        // Initial state: Compressing
+    const startUpload = useCallback(async (file, objectPath, options = {}) => {
+        const uploadId = `upl_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+
         setUploads(prev => ({
             ...prev,
             [uploadId]: {
                 id: uploadId,
                 fileName: file.name,
-                progress: 0,
-                status: 'compressing',
-                error: null,
-                url: null,
-                fileType: file.type,
                 fileSize: file.size,
-                path: path
-            }
-        }));
-
-        let processedFile = file;
-        let dimensions = null;
-
-        // Detect dimensions and compress if it's an image
-        if (file.type.startsWith('image/')) {
-            try {
-                dimensions = await new Promise((resolve) => {
-                    const img = new Image();
-                    img.onload = () => resolve({ width: img.width, height: img.height });
-                    img.onerror = () => resolve(null);
-                    img.src = URL.createObjectURL(file);
-                });
-
-                const options = {
-                    maxSizeMB: 1,
-                    maxWidthOrHeight: 1600,
-                    useWebWorker: true,
-                    initialQuality: 0.8
-                };
-                processedFile = await imageCompression(file, options);
-            } catch (error) {
-                console.warn("Compression / Dimension check failed", error);
-            }
-        }
-
-        // Before starting, check if it was cancelled during compression
-        let isCancelled = false;
-        setUploads(prev => {
-            if (!prev[uploadId] || prev[uploadId].status === 'cancelled') {
-                isCancelled = true;
-            }
-            return prev;
-        });
-
-        if (isCancelled) return { uploadId, uploadTask: null };
-
-        const storageRef = ref(storage, path);
-        const uploadTask = uploadBytesResumable(storageRef, processedFile, metadata);
-
-        // Store task ref
-        uploadTasksRef.current[uploadId] = uploadTask;
-
-        // Update state to uploading
-        setUploads(prev => ({
-            ...prev,
-            [uploadId]: {
-                ...prev[uploadId],
-                fileSize: processedFile.size,
+                progress: 0,
                 status: 'uploading',
-                width: dimensions?.width,
-                height: dimensions?.height
+                error: null
             }
         }));
 
-        // Listen for state changes (throttle updates)
-        let lastUpdate = 0;
-        let retryCount = 0;
-        const maxRetries = 5;
-
-        const unsubscribe = uploadTask.on('state_changed',
-            (snapshot) => {
-                const now = Date.now();
-                const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-
-                // Reset retry count on progress
-                if (progress > lastUpdate) retryCount = 0;
-
-                // Emit at most every 200ms or on key events to reduce flickering
-                if (now - lastUpdate > 200 || progress === 0 || progress >= 100) {
-                    lastUpdate = now;
+        try {
+            const result = await uploadManager.uploadResumable({
+                file,
+                objectPath,
+                bucket: options.bucket || 'novachat-media',
+                uploadId,
+                onProgress: ({ percentage }) => {
                     setUploads(prev => {
                         if (!prev[uploadId]) return prev;
                         return {
                             ...prev,
                             [uploadId]: {
                                 ...prev[uploadId],
-                                progress,
-                                status: snapshot.state === 'paused' ? 'paused' : 'uploading'
+                                progress: percentage,
+                                status: percentage >= 100 ? 'completing' : 'uploading'
                             }
                         };
                     });
+                    if (options.onProgress) options.onProgress(percentage);
                 }
-            },
-            async (error) => {
-                console.error("Upload error:", error.code, error.message);
+            });
 
-                // Handle network errors with auto-retry
-                const isRetryable =
-                    error.code === 'storage/retry-limit-exceeded' ||
-                    error.code === 'storage/unknown' ||
-                    error.code === 'storage/network-error';
+            setUploads(prev => {
+                const next = { ...prev };
+                delete next[uploadId];
+                return next;
+            });
 
-                if (isRetryable && retryCount < maxRetries) {
-                    retryCount++;
-                    const delay = Math.pow(2, retryCount) * 1000;
-                    console.log(`Retrying upload ${uploadId} in ${delay}ms (Attempt ${retryCount}/${maxRetries})`);
-
-                    setUploads(prev => ({
-                        ...prev,
-                        [uploadId]: { ...prev[uploadId], status: 'retrying', error: `Network error. Retrying... (${retryCount}/${maxRetries})` }
-                    }));
-
-                    setTimeout(() => {
-                        if (uploadTasksRef.current[uploadId]) {
-                            uploadTasksRef.current[uploadId].resume();
-                        }
-                    }, delay);
-                    return;
-                }
-
-                setUploads(prev => {
-                    if (!prev[uploadId]) return prev;
-                    return {
-                        ...prev,
-                        [uploadId]: {
-                            ...prev[uploadId],
-                            status: error.code === 'storage/canceled' ? 'cancelled' : 'error',
-                            error: error.message
-                        }
-                    };
-                });
-                delete uploadTasksRef.current[uploadId];
-            },
-            async () => {
-                try {
-                    const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-                    setUploads(prev => {
-                        if (!prev[uploadId]) return prev;
-                        return {
-                            ...prev,
-                            [uploadId]: {
-                                ...prev[uploadId],
-                                progress: 100,
-                                status: 'completed',
-                                url: downloadURL
-                            }
-                        };
-                    });
-                } catch (e) {
-                    console.error("Failed to get download URL", e);
-                    setUploads(prev => ({
-                        ...prev,
-                        [uploadId]: { ...prev[uploadId], status: 'error', error: "Failed to finalize upload." }
-                    }));
-                } finally {
-                    delete uploadTasksRef.current[uploadId];
-                }
-            }
-        );
-
-        return { uploadId, uploadTask };
-    }, []);
-
-    const pauseUpload = useCallback((uploadId) => {
-        const task = uploadTasksRef.current[uploadId];
-        if (task) {
-            task.pause();
+            return { uploadId, result };
+        } catch (error) {
             setUploads(prev => ({
                 ...prev,
-                [uploadId]: { ...prev[uploadId], status: 'paused' }
+                [uploadId]: {
+                    ...prev[uploadId],
+                    status: 'failed',
+                    error: error.message
+                }
             }));
-        }
-    }, []);
-
-    const resumeUpload = useCallback((uploadId) => {
-        const task = uploadTasksRef.current[uploadId];
-        if (task) {
-            task.resume();
-            setUploads(prev => ({
-                ...prev,
-                [uploadId]: { ...prev[uploadId], status: 'uploading' }
-            }));
+            throw error;
         }
     }, []);
 
     const cancelUpload = useCallback((uploadId) => {
-        const task = uploadTasksRef.current[uploadId];
-        if (task) {
-            task.cancel();
-            setUploads(prev => ({
-                ...prev,
-                [uploadId]: { ...prev[uploadId], status: 'cancelled' }
-            }));
-            delete uploadTasksRef.current[uploadId];
-        }
-    }, []);
-
-    const clearCompleted = useCallback(() => {
-        setUploads(prev => {
-            const newUploads = { ...prev };
-            Object.keys(newUploads).forEach(key => {
-                if (newUploads[key].status === 'completed' || newUploads[key].status === 'cancelled') {
-                    delete newUploads[key];
-                    if (uploadTasksRef.current[key]) {
-                        delete uploadTasksRef.current[key];
-                    }
-                }
+        const cancelled = uploadManager.cancelUpload(uploadId);
+        if (cancelled) {
+            setUploads(prev => {
+                const next = { ...prev };
+                delete next[uploadId];
+                return next;
             });
-            return newUploads;
-        });
-    }, []);
-
-    const removeUpload = useCallback((uploadId) => {
-        setUploads(prev => {
-            const newUploads = { ...prev };
-            delete newUploads[uploadId];
-            return newUploads;
-        });
-        if (uploadTasksRef.current[uploadId]) {
-            delete uploadTasksRef.current[uploadId];
         }
+        return cancelled;
     }, []);
 
     const value = useMemo(() => ({
         uploads,
         startUpload,
-        pauseUpload,
-        resumeUpload,
-        cancelUpload,
-        clearCompleted,
-        removeUpload
-    }), [uploads, startUpload, pauseUpload, resumeUpload, cancelUpload, clearCompleted, removeUpload]);
+        cancelUpload
+    }), [uploads, startUpload, cancelUpload]);
 
     return (
         <FileUploadContext.Provider value={value}>
             {children}
         </FileUploadContext.Provider>
     );
-};
+}

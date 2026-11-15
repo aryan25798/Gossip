@@ -58,6 +58,8 @@ export function ChatHeader({
                         <Button
                             variant="ghost"
                             size="icon"
+                            title="Video Call"
+                            data-testid="video-call-btn"
                             className="rounded-full hover:text-text-1 min-w-[40px] min-h-[40px] w-10 h-10 md:w-10 md:h-10 flex items-center justify-center disabled:opacity-30 disabled:hover:text-text-2"
                             onClick={() => {
                                 console.log("[ChatHeader] Video call clicked for:", otherUser?.uid);
@@ -70,6 +72,8 @@ export function ChatHeader({
                         <Button
                             variant="ghost"
                             size="icon"
+                            title="Voice Call"
+                            data-testid="voice-call-btn"
                             className="rounded-full hover:text-text-1 min-w-[40px] min-h-[40px] w-10 h-10 md:w-10 md:h-10 flex items-center justify-center disabled:opacity-30 disabled:hover:text-text-2"
                             onClick={() => {
                                 console.log("[ChatHeader] Audio call clicked for:", otherUser?.uid);
@@ -136,6 +140,28 @@ export function ChatHeader({
                                     onClick={() => setShowHeaderMenu(false)}
                                 >
                                     Close chat
+                                </button>
+                                <button
+                                    className="w-full text-left px-4 py-3 text-[14px] text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/20 transition-colors font-medium"
+                                    onClick={() => {
+                                        setShowHeaderMenu(false);
+                                        const reason = prompt("Please provide a reason for reporting this user / conversation:");
+                                        if (reason && reason.trim()) {
+                                            import('../../services/chatService').then(m => {
+                                                m.chatService.reportMessage({
+                                                    reporterId: otherUser?.currentUserId,
+                                                    reportedUserId: otherUser?.uid || otherUser?.id,
+                                                    conversationId: chat?.id,
+                                                    reason: reason.trim(),
+                                                    category: 'inappropriate',
+                                                    priority: 'normal'
+                                                }).then(() => alert("Report submitted for administrative review. Thank you."))
+                                                .catch(e => alert("Report failed: " + e.message));
+                                            });
+                                        }
+                                    }}
+                                >
+                                    Report conversation
                                 </button>
                                 <div className="h-px bg-border/50 my-1 mx-2" />
                                 <button

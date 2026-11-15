@@ -1,13 +1,11 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { db, storage } from '../firebase';
-import { collection, query, where, getDocs, orderBy, addDoc, serverTimestamp, updateDoc, doc } from 'firebase/firestore';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { supabase } from '../supabase';
+import { chatService } from '../services/chatService';
 import { Avatar } from '../components/ui/Avatar';
 import { Button } from '../components/ui/Button';
 import { FaPaperPlane, FaSpinner, FaImage, FaTimes } from 'react-icons/fa';
-import Layout from '../layouts/MainLayout';
 
 const SharePage = () => {
     const [loading, setLoading] = useState(true);
@@ -18,12 +16,12 @@ const SharePage = () => {
     const [selectedChats, setSelectedChats] = useState([]);
     const navigate = useNavigate();
     const { currentUser } = useAuth();
+    const currentUserId = currentUser?.uid || currentUser?.id;
     const [error, setError] = useState('');
 
     useEffect(() => {
         const loadSharedContent = async () => {
             try {
-                // Check if we have shared data in cache
                 if ('caches' in window) {
                     const cache = await caches.open('share-target-cache');
                     const response = await cache.match('/api/share-data');
@@ -39,12 +37,7 @@ const SharePage = () => {
                                 setSharedMediaBlob(blob);
                             }
                         }
-
-                        // Cleanup cache after reading
-                        // await cache.delete('/api/share-data');
-                        // await cache.delete('/api/share-media');
                     } else {
-                        // No data found, redirect to home
                         navigate('/');
                         return;
                     }
@@ -57,59 +50,13 @@ const SharePage = () => {
             }
         };
 
-        const loadChats = async () => {
-            if (!currentUser) return;
-            try {
-                // Determine if we are in share mode first
-                // Better parallel execution:
-                // loadSharedContent is critical. loadChats is needed only if we have content.
-            } catch (err) {
-                console.error("Error loading chats:", err);
-            }
-        };
-
-        if (currentUser) {
+        if (currentUserId) {
             loadSharedContent();
-
-            // Fetch recent chats efficiently
-            const fetchChats = async () => {
-                const q = query(
-                    collection(db, 'chats'),
-                    where('participants', 'array-contains', currentUser.uid),
-                    orderBy('lastMessageTime', 'desc')
-                    // limit(10) // Optional limit
-                );
-                const snapshot = await getDocs(q);
-
-                // Process chats to get display names
-                const chatList = await Promise.all(snapshot.docs.map(async (doc) => {
-                    const chatData = doc.data();
-                    let name = 'Chat';
-                    let photo = null;
-
-                    if (chatData.isGroup) {
-                        name = chatData.groupName;
-                        photo = chatData.groupPhoto;
-                    } else {
-                        const otherId = chatData.participants.find(p => p !== currentUser.uid);
-                        // In a real app we'd fetch the user profile. 
-                        // For now we might rely on cached profiles or just use ID if simple.
-                        // Ideally we fetch user data.
-                        const userDoc = await getDocs(query(collection(db, 'users'), where('uid', '==', otherId)));
-                        if (!userDoc.empty) {
-                            const userData = userDoc.docs[0].data();
-                            name = userData.displayName;
-                            photo = userData.photoURL;
-                        }
-                    }
-                    return { id: doc.id, ...chatData, displayName: name, photoURL: photo };
-                }));
-                setChats(chatList);
-            };
-            fetchChats();
+            chatService.getUserChats(currentUserId).then(userChats => {
+                setChats(userChats || []);
+            });
         }
-
-    }, [currentUser, navigate]);
+    }, [currentUserId, navigate]);
 
     const toggleChat = (chatId) => {
         setSelectedChats(prev =>
@@ -120,55 +67,19 @@ const SharePage = () => {
     };
 
     const handleSend = async () => {
-        if (selectedChats.length === 0) return;
+        if (selectedChats.length === 0 || !currentUser) return;
         setSending(true);
 
         try {
-            let mediaUrl = null;
-            let mediaType = null;
-
-            if (sharedMediaBlob) {
-                // Upload media
-                const fileExt = sharedMediaBlob.type.split('/')[1] || 'bin';
-                const fileName = `shared_${Date.now()}.${fileExt}`;
-                const storageRef = ref(storage, `chat_media/${fileName}`);
-                await uploadBytes(storageRef, sharedMediaBlob);
-                mediaUrl = await getDownloadURL(storageRef);
-                mediaType = sharedMediaBlob.type.startsWith('image') ? 'image' : 'video'; // Simple check
+            for (const chatId of selectedChats) {
+                if (sharedMediaBlob) {
+                    const file = new File([sharedMediaBlob], `shared_${Date.now()}`, { type: sharedMediaBlob.type });
+                    await chatService.sendMediaMessage(chatId, currentUser, file, sharedData?.text || '');
+                } else if (sharedData?.text) {
+                    await chatService.sendMessage(chatId, currentUser, sharedData.text);
+                }
             }
 
-            // Send to all selected chats
-            const promises = selectedChats.map(async (chatId) => {
-                const messageData = {
-                    text: sharedData.text || '',
-                    senderId: currentUser.uid,
-                    senderName: currentUser.displayName, // Ideally from profile
-                    senderPhoto: currentUser.photoURL,
-                    timestamp: serverTimestamp(),
-                    read: false,
-                    delivered: false,
-                    type: mediaUrl ? 'media' : 'text',
-                };
-
-                if (mediaUrl) {
-                    messageData.mediaUrl = mediaUrl;
-                    messageData.mediaType = mediaType;
-                }
-
-                const messagesRef = collection(db, 'chats', chatId, 'messages');
-                await addDoc(messagesRef, messageData);
-
-                // Update last message
-                await updateDoc(doc(db, 'chats', chatId), {
-                    lastMessage: mediaUrl ? (mediaType === 'image' ? '📷 Image' : '🎥 Video') : (sharedData.text || 'Shared content'),
-                    lastMessageTime: serverTimestamp(),
-                    [`unreadCount.${chatId}`]: 1 // Simplified: logic needs to increment per participant
-                });
-            });
-
-            await Promise.all(promises);
-
-            // Cleanup cache on success
             if ('caches' in window) {
                 const cache = await caches.open('share-target-cache');
                 await cache.delete('/api/share-data');
@@ -176,100 +87,87 @@ const SharePage = () => {
             }
 
             navigate('/');
-
         } catch (err) {
             console.error("Error sending shared content:", err);
-            setError("Failed to send content.");
+            setError("Failed to send content. Please try again.");
             setSending(false);
         }
     };
 
     if (loading) {
         return (
-            <div className="flex items-center justify-center h-screen bg-background text-primary">
-                <FaSpinner className="animate-spin text-4xl" />
+            <div className="flex h-screen items-center justify-center bg-background">
+                <FaSpinner className="animate-spin text-3xl text-primary" />
             </div>
         );
     }
 
-    if (!sharedData) return null;
-
     return (
-        <div className="flex flex-col h-[100dvh] bg-surface text-text-1">
+        <div className="flex flex-col h-screen bg-background text-foreground">
             {/* Header */}
-            <div className="h-16 px-4 flex items-center bg-surface-elevated border-b border-border/30 shadow-sm shrink-0">
-                <Button variant="ghost" className="mr-2" onClick={() => navigate('/')}>
+            <div className="flex items-center justify-between p-4 border-b border-border bg-surface">
+                <h1 className="text-xl font-bold">Forward to...</h1>
+                <Button variant="ghost" size="icon" onClick={() => navigate('/')}>
                     <FaTimes />
                 </Button>
-                <h1 className="text-lg font-semibold flex-1">Share to...</h1>
             </div>
 
             {/* Content Preview */}
-            <div className="p-4 bg-background/50 border-b border-border/30 shrink-0">
-                <div className="bg-surface p-3 rounded-lg shadow-sm border border-border/50 flex gap-3">
-                    {sharedMediaBlob ? (
-                        <div className="w-16 h-16 bg-black/10 rounded-md flex items-center justify-center shrink-0 overflow-hidden">
-                            {sharedMediaBlob.type.startsWith('image') ? (
-                                <img src={URL.createObjectURL(sharedMediaBlob)} alt="Preview" className="w-full h-full object-cover" />
-                            ) : (
-                                <FaImage className="text-text-2" />
-                            )}
-                        </div>
-                    ) : null}
-                    <div className="flex-1 min-w-0">
-                        {sharedData.text && (
-                            <p className="text-sm line-clamp-3 whitespace-pre-wrap">{sharedData.text}</p>
-                        )}
-                        {!sharedData.text && !sharedData.hasMedia && (
-                            <p className="text-sm italic text-text-2">No content</p>
+            <div className="p-4 bg-surface-elevated border-b border-border flex items-center gap-4">
+                {sharedMediaBlob ? (
+                    <div className="w-16 h-16 bg-muted rounded-lg overflow-hidden flex items-center justify-center flex-shrink-0">
+                        {sharedMediaBlob.type.startsWith('image') ? (
+                            <img src={URL.createObjectURL(sharedMediaBlob)} alt="Preview" className="w-full h-full object-cover" />
+                        ) : (
+                            <FaImage className="text-2xl text-muted-foreground" />
                         )}
                     </div>
+                ) : null}
+                <div className="flex-1 overflow-hidden">
+                    <p className="text-sm font-medium truncate">{sharedData?.title || 'Shared Content'}</p>
+                    <p className="text-xs text-muted-foreground line-clamp-2">{sharedData?.text || sharedData?.url}</p>
                 </div>
             </div>
 
-            {/* Chat Selection */}
-            <div className="flex-1 overflow-y-auto p-2">
-                <h2 className="px-2 py-2 text-xs font-bold text-primary uppercase tracking-wider">Recent Chats</h2>
-                {chats.map(chat => (
-                    <div
-                        key={chat.id}
-                        onClick={() => toggleChat(chat.id)}
-                        className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors mb-1 ${selectedChats.includes(chat.id)
-                                ? 'bg-primary/10 border border-primary/30'
-                                : 'hover:bg-surface-elevated border border-transparent'
-                            }`}
-                    >
-                        <div className="relative">
-                            <Avatar src={chat.photoURL} alt={chat.displayName} size="md" />
-                            {selectedChats.includes(chat.id) && (
-                                <div className="absolute -bottom-1 -right-1 bg-primary text-white rounded-full w-5 h-5 flex items-center justify-center text-xs border-2 border-surface">
-                                    ✓
-                                </div>
-                            )}
+            {/* Error Message */}
+            {error && <div className="p-3 bg-red-500/10 text-red-500 text-sm text-center">{error}</div>}
+
+            {/* Chat List */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Recent Chats</h2>
+                {chats.map(chat => {
+                    const isSelected = selectedChats.includes(chat.id);
+                    return (
+                        <div
+                            key={chat.id}
+                            onClick={() => toggleChat(chat.id)}
+                            className={`flex items-center gap-3 p-3 rounded-xl cursor-pointer transition-colors ${isSelected ? 'bg-primary/10 border border-primary/20' : 'hover:bg-surface-elevated'}`}
+                        >
+                            <Avatar src={chat.photoURL} alt={chat.name} size="md" />
+                            <div className="flex-1 min-w-0">
+                                <h3 className="font-medium text-sm truncate">{chat.name}</h3>
+                                <p className="text-xs text-muted-foreground truncate">{chat.lastMessage || 'No messages'}</p>
+                            </div>
+                            <div className={`w-5 h-5 rounded-full border flex items-center justify-center ${isSelected ? 'bg-primary border-primary text-white' : 'border-border'}`}>
+                                {isSelected && <div className="w-2 h-2 bg-white rounded-full" />}
+                            </div>
                         </div>
-                        <div className="flex-1 min-w-0">
-                            <h3 className="font-semibold text-text-1 truncate">{chat.displayName}</h3>
-                            <p className="text-xs text-text-2 truncate">
-                                {chat.isGroup ? 'Group' : 'Private Chat'}
-                            </p>
-                        </div>
-                    </div>
-                ))}
+                    );
+                })}
             </div>
 
-            {/* Footer Action */}
-            <div className="p-4 bg-surface-elevated border-t border-border/30 shrink-0">
+            {/* Action Bar */}
+            <div className="p-4 border-t border-border bg-surface flex justify-between items-center">
+                <span className="text-sm text-muted-foreground">
+                    {selectedChats.length} {selectedChats.length === 1 ? 'chat' : 'chats'} selected
+                </span>
                 <Button
-                    className="w-full rounded-full h-12 text-[15px] font-semibold shadow-premium"
-                    disabled={selectedChats.length === 0 || sending}
                     onClick={handleSend}
+                    disabled={selectedChats.length === 0 || sending}
+                    className="flex items-center gap-2 bg-primary hover:bg-primary/90 text-white rounded-xl px-6"
                 >
-                    {sending ? (
-                        <FaSpinner className="animate-spin mr-2" />
-                    ) : (
-                        <FaPaperPlane className="mr-2" />
-                    )}
-                    Send to {selectedChats.length} chat{selectedChats.length !== 1 ? 's' : ''}
+                    {sending ? <FaSpinner className="animate-spin" /> : <FaPaperPlane />}
+                    <span>Send</span>
                 </Button>
             </div>
         </div>

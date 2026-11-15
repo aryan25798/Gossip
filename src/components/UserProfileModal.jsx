@@ -1,65 +1,68 @@
 import React, { useState, useEffect } from 'react';
 import { FaTimes, FaEnvelope, FaInfoCircle, FaUsers, FaTrash, FaEdit, FaCheck, FaUserPlus, FaCrown, FaSignOutAlt } from 'react-icons/fa';
-import { db } from "../firebase";
-import { doc, getDoc, updateDoc, arrayRemove, arrayUnion, collection, getDocs } from "firebase/firestore";
+import { supabase } from "../supabase";
 import { useAuth } from "../contexts/AuthContext";
 
 export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
     const [participants, setParticipants] = useState([]);
     const { currentUser } = useAuth();
+    const currentUserId = currentUser?.uid || currentUser?.id;
     const [isAdmin, setIsAdmin] = useState(false);
     const [isEditing, setIsEditing] = useState(false);
-    const [newName, setNewName] = useState(user.groupName || "");
+    const [newName, setNewName] = useState(user.name || user.groupName || "");
     const [showAddUser, setShowAddUser] = useState(false);
     const [allUsers, setAllUsers] = useState([]);
 
     useEffect(() => {
-        if (isGroup && user.participants) {
-            // Fetch participant details
+        if (isGroup && chatId) {
             const fetchParticipants = async () => {
-                const list = [];
-                for (const uid of user.participants) {
-                    const snap = await getDoc(doc(db, "users", uid));
-                    if (snap.exists()) {
-                        list.push({ id: uid, ...snap.data(), role: user.chatRole?.[uid] || 'member' });
+                const { data } = await supabase
+                    .from('conversation_participants')
+                    .select('user_id, role, users(id, display_name, avatar_url, about_status, email)')
+                    .eq('conversation_id', chatId);
+
+                if (data) {
+                    const list = data.map(p => ({
+                        id: p.user_id,
+                        displayName: p.users?.display_name || p.users?.email || 'User',
+                        photoURL: p.users?.avatar_url,
+                        role: p.role
+                    }));
+                    setParticipants(list);
+
+                    const me = list.find(p => p.id === currentUserId);
+                    if (me && (me.role === 'admin' || me.role === 'owner')) {
+                        setIsAdmin(true);
                     }
                 }
-                setParticipants(list);
             };
             fetchParticipants();
-
-            // Check if current user is admin
-            if (user.groupAdmin === currentUser.uid || user.chatRole?.[currentUser.uid] === 'admin') {
-                setIsAdmin(true);
-            }
         }
-    }, [user, isGroup, currentUser]);
+    }, [chatId, isGroup, currentUserId]);
 
     // Fetch all users for "Add Participant"
     useEffect(() => {
         if (showAddUser) {
             const fetchAll = async () => {
-                const snap = await getDocs(collection(db, "users"));
-                const list = [];
-                snap.forEach(d => {
-                    if (d.id !== currentUser.uid && !user.participants.includes(d.id)) {
-                        list.push({ id: d.id, ...d.data() });
-                    }
-                });
-                setAllUsers(list);
+                const { data } = await supabase.from('users').select('*').limit(50);
+                if (data) {
+                    const currentPartIds = new Set(participants.map(p => p.id));
+                    setAllUsers(data.filter(u => u.id !== currentUserId && !currentPartIds.has(u.id)).map(u => ({
+                        id: u.id,
+                        displayName: u.display_name || u.email,
+                        photoURL: u.avatar_url
+                    })));
+                }
             };
             fetchAll();
         }
-    }, [showAddUser, user.participants]);
+    }, [showAddUser, participants, currentUserId]);
 
     const removeParticipant = async (uid) => {
         if (!isAdmin) return;
         if (window.confirm("Remove this user?")) {
             try {
-                const chatRef = doc(db, "chats", chatId);
-                await updateDoc(chatRef, {
-                    participants: arrayRemove(uid)
-                });
+                await supabase.from('conversation_participants').delete().match({ conversation_id: chatId, user_id: uid });
                 setParticipants(prev => prev.filter(p => p.id !== uid));
             } catch (err) {
                 console.error("Error removing participant", err);
@@ -70,7 +73,7 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
     const handleUpdateName = async () => {
         if (!newName.trim()) return;
         try {
-            await updateDoc(doc(db, "chats", chatId), { groupName: newName });
+            await supabase.from('conversations').update({ title: newName }).eq('id', chatId);
             setIsEditing(false);
         } catch (err) { console.error("Update failed", err); }
     };
@@ -78,29 +81,30 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
     const handlePromote = async (uid) => {
         if (!isAdmin) return;
         if (window.confirm("Make this user an Admin?")) {
-            await updateDoc(doc(db, "chats", chatId), {
-                [`chatRole.${uid}`]: 'admin'
-            });
+            await supabase.from('conversation_participants').update({ role: 'admin' }).match({ conversation_id: chatId, user_id: uid });
             setParticipants(prev => prev.map(p => p.id === uid ? { ...p, role: 'admin' } : p));
         }
     };
 
     const handleAddParticipant = async (uid) => {
         try {
-            await updateDoc(doc(db, "chats", chatId), {
-                participants: arrayUnion(uid),
-                [`chatRole.${uid}`]: 'member'
+            await supabase.from('conversation_participants').insert({
+                conversation_id: chatId,
+                user_id: uid,
+                role: 'member'
             });
             setShowAddUser(false);
+            const userAdded = allUsers.find(u => u.id === uid);
+            if (userAdded) {
+                setParticipants(prev => [...prev, { ...userAdded, role: 'member' }]);
+            }
         } catch (err) { console.error("Add failed", err); }
     };
 
     const handleLeaveGroup = async () => {
         if (window.confirm("Are you sure you want to leave this group?")) {
             try {
-                await updateDoc(doc(db, "chats", chatId), {
-                    participants: arrayRemove(currentUser.uid)
-                });
+                await supabase.from('conversation_participants').delete().match({ conversation_id: chatId, user_id: currentUserId });
                 onClose();
             } catch (err) { console.error("Leave failed", err); }
         }
@@ -114,7 +118,7 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                 <button className="close-btn" onClick={onClose}><FaTimes /></button>
 
                 <div className="profile-header-img">
-                    <img src={user.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.uid}`} alt={user.displayName} />
+                    <img src={user.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${user.uid || user.id}`} alt={user.displayName || user.name} />
                 </div>
 
                 {isEditing ? (
@@ -124,7 +128,7 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                     </div>
                 ) : (
                     <div className="name-row">
-                        <h2 className="profile-name">{user.displayName || user.groupName}</h2>
+                        <h2 className="profile-name">{user.displayName || user.name || user.groupName}</h2>
                         {isGroup && isAdmin && <button className="edit-btn" onClick={() => setIsEditing(true)}><FaEdit /></button>}
                     </div>
                 )}
@@ -134,12 +138,8 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                         <p>{participants.length} participants</p>
                     ) : (
                         <div className="user-presence">
-                            {(user.privacy?.lastSeen !== 'nobody') && (
-                                <>
-                                    <span className={`presence-dot ${user.isOnline ? 'online' : 'offline'}`}></span>
-                                    <span>{user.isOnline ? 'Online' : `Last seen ${user.last_changed ? new Date(user.last_changed).toLocaleString() : 'recently'}`}</span>
-                                </>
-                            )}
+                            <span className="presence-dot online"></span>
+                            <span>{user.aboutStatus || "Hey there! I am using NovaChat."}</span>
                         </div>
                     )}
                 </div>
@@ -151,14 +151,14 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                                 <FaEnvelope className="icon" />
                                 <div>
                                     <label>Email</label>
-                                    <p>{user.email || "Hidden"}</p>
+                                    <p>{user.email || "Protected"}</p>
                                 </div>
                             </div>
                             <div className="detail-row">
                                 <FaInfoCircle className="icon" />
                                 <div>
                                     <label>About</label>
-                                    <p>{user.about || "Available"}</p>
+                                    <p>{user.aboutStatus || user.about || "Available"}</p>
                                 </div>
                             </div>
                         </>
@@ -191,12 +191,12 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                                     <div key={p.id} className="participant-item">
                                         <img src={p.photoURL || `https://api.dicebear.com/7.x/avataaars/svg?seed=${p.id}`} className="tiny-avatar" />
                                         <div className="p-info">
-                                            <span>{p.displayName} {p.id === currentUser.uid && "(You)"}</span>
-                                            {p.role === 'admin' && <span className="admin-badge">Admin</span>}
+                                            <span>{p.displayName} {p.id === currentUserId && "(You)"}</span>
+                                            {(p.role === 'admin' || p.role === 'owner') && <span className="admin-badge">Admin</span>}
                                         </div>
-                                        {isAdmin && p.id !== currentUser.uid && (
+                                        {isAdmin && p.id !== currentUserId && (
                                             <div className="admin-actions">
-                                                {p.role !== 'admin' && <button className="promote-btn" onClick={() => handlePromote(p.id)} title="Make Admin"><FaCrown /></button>}
+                                                {p.role !== 'admin' && p.role !== 'owner' && <button className="promote-btn" onClick={() => handlePromote(p.id)} title="Make Admin"><FaCrown /></button>}
                                                 <button className="remove-btn" onClick={() => removeParticipant(p.id)} title="Remove"><FaTrash /></button>
                                             </div>
                                         )}
@@ -276,8 +276,8 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                 }
                 .user-presence { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--text-secondary); }
                 .presence-dot { width: 10px; height: 10px; border-radius: 50%; }
-                .presence-dot.online { background: var(--light-green); }
-                .presence-dot.offline { background: var(--text-lighter); }
+                .presence-dot.online { background: #10b981; }
+                .presence-dot.offline { background: #9ca3af; }
                 
                 .profile-details {
                     padding: 0;
@@ -295,6 +295,7 @@ export default function UserProfileModal({ user, onClose, isGroup, chatId }) {
                     display: flex;
                     align-items: center;
                     gap: 30px;
+                    padding: 14px 30px;
                 }
                 .detail-row .icon { color: var(--text-lighter); font-size: 20px; }
                 .detail-row label { font-size: 14px; color: var(--teal-green); display: block; margin-bottom: 4px; }

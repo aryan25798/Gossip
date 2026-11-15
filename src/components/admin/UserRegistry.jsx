@@ -1,431 +1,655 @@
-import React, { useState, useEffect } from 'react';
-import { db, functions } from '../../firebase';
-import { collection, query, getDocs, doc, updateDoc, limit, startAfter, orderBy, getDoc } from 'firebase/firestore';
-import { httpsCallable } from 'firebase/functions';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { adminService } from '../../services/adminService';
 import { useAuth } from '../../contexts/AuthContext';
-import SpyChatViewer from './SpyChatViewer';
-import UserDossier from './UserDossier';
-import { format } from 'date-fns';
-import { Search, Filter, Shield, ShieldAlert, User, MoreHorizontal, RefreshCw, Eye, Trash2, MapPin, ExternalLink } from 'lucide-react';
+import { Pagination } from '../ui/Pagination';
+import { BulkActionToolbar } from '../ui/BulkActionToolbar';
+import { ConfirmModal } from '../ui/ConfirmModal';
 import { Avatar } from '../ui/Avatar';
+import { format } from 'date-fns';
+import {
+    Search, Filter, Shield, ShieldAlert, Trash2, RefreshCw,
+    MapPin, UserCheck, UserX, ArrowUpDown, ChevronDown, Download, Check, Eye
+} from 'lucide-react';
 
-const UserRegistry = ({ onOpenDossier, onBan, onNuke }) => {
+export const UserRegistry = ({ onOpenDossier }) => {
     const { currentUser } = useAuth();
+
+    // Data & Pagination State
     const [users, setUsers] = useState([]);
-    const [filteredUsers, setFilteredUsers] = useState([]);
-    const [loading, setLoading] = useState(false);
-    const [lastDoc, setLastDoc] = useState(null);
-    const [hasMore, setHasMore] = useState(true);
-    const [selectedChat, setSelectedChat] = useState(null);
-    const [nuking, setNuking] = useState(null);
-    const [locations, setLocations] = useState({});
-    const [fetchingLocation, setFetchingLocation] = useState({});
+    const [loading, setLoading] = useState(true);
+    const [page, setPage] = useState(1);
+    const [pageSize, setPageSize] = useState(20);
+    const [totalCount, setTotalCount] = useState(0);
 
-    const fetchLocation = async (uid) => {
-        if (locations[uid] || fetchingLocation[uid]) return;
-        setFetchingLocation(prev => ({ ...prev, [uid]: true }));
-        try {
-            const docSnap = await getDoc(doc(db, 'user_locations', uid));
-            if (docSnap.exists()) {
-                setLocations(prev => ({ ...prev, [uid]: docSnap.data() }));
-            } else {
-                setLocations(prev => ({ ...prev, [uid]: 'NA' }));
-            }
-        } catch (e) {
-            console.error("Location fetch failed", e);
-        } finally {
-            setFetchingLocation(prev => ({ ...prev, [uid]: false }));
-        }
-    };
-
-    // Filter States
+    // Filters & Sorting
     const [searchTerm, setSearchTerm] = useState('');
-    const [filterStatus, setFilterStatus] = useState('all'); // 'all', 'active', 'banned'
+    const [debouncedSearch, setDebouncedSearch] = useState('');
+    const [roleFilter, setRoleFilter] = useState('all');
+    const [statusFilter, setStatusFilter] = useState('all');
+    const [sortBy, setSortBy] = useState('created_at');
+    const [sortOrder, setSortOrder] = useState('desc');
 
-    const DOCUMENTS_PER_PAGE = 50;
+    // Selection & Bulk Actions
+    const [selectedIds, setSelectedIds] = useState(new Set());
+    const [bulkProcessing, setBulkProcessing] = useState(false);
+    const [processingText, setProcessingText] = useState('');
 
-    // Server-Side Search Implementation
+    // Modal Confirmation State
+    const [confirmModal, setConfirmModal] = useState({
+        isOpen: false,
+        title: '',
+        message: '',
+        confirmText: 'Confirm',
+        isDestructive: false,
+        requirePhrase: null,
+        onConfirm: () => {}
+    });
+
+    // Debounce search input
     useEffect(() => {
-        const delayDebounceFn = setTimeout(() => {
-            fetchUsers(false, searchTerm);
-        }, 600);
+        const handler = setTimeout(() => {
+            setDebouncedSearch(searchTerm);
+            setPage(1); // Reset to page 1 on new search
+        }, 400);
+        return () => clearTimeout(handler);
+    }, [searchTerm]);
 
-        return () => clearTimeout(delayDebounceFn);
-    }, [searchTerm, filterStatus]);
+    // Clear selection on page or filter change
+    useEffect(() => {
+        setSelectedIds(new Set());
+    }, [page, pageSize, roleFilter, statusFilter, debouncedSearch]);
 
-    const fetchUsers = async (isNextPage = false, search = '') => {
-        // --- Neural Bypass: Audit Account Override ---
-
+    // Fetch users from server
+    const fetchUsers = useCallback(async () => {
         setLoading(true);
         try {
-            let q;
-            const usersRef = collection(db, 'users');
-            const term = search.toLowerCase().trim();
+            const res = await adminService.getUsersPaginated({
+                page,
+                pageSize,
+                search: debouncedSearch,
+                role: roleFilter,
+                status: statusFilter,
+                sortBy,
+                sortOrder
+            });
 
-            if (term) {
-                // SERVER-SIDE SEARCH
-                // Note: We use the same indexes as userService.js
-                // We handle 'email' or 'displayName'
-                if (term.includes('@')) {
-                    q = query(
-                        usersRef,
-                        where('email', '>=', term),
-                        where('email', '<=', term + '\uf8ff'),
-                        limit(DOCUMENTS_PER_PAGE)
-                    );
-                } else {
-                    q = query(
-                        usersRef,
-                        where('displayName', '>=', term),
-                        where('displayName', '<=', term + '\uf8ff'),
-                        limit(DOCUMENTS_PER_PAGE)
-                    );
-                }
-
-                // Note: Pagination during search is reset
-                setHasMore(false);
-            } else {
-                // DEFAULT LIST (Pagination supported)
-                if (isNextPage && lastDoc) {
-                    q = query(usersRef, orderBy('createdAt', 'desc'), limit(DOCUMENTS_PER_PAGE), startAfter(lastDoc));
-                } else {
-                    q = query(usersRef, orderBy('createdAt', 'desc'), limit(DOCUMENTS_PER_PAGE));
-                }
-                setHasMore(true);
-            }
-
-            const snapshot = await getDocs(q);
-            let userList = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
-            // Client-side Refinement for 'status' filter if needed (since basic indexes might not cover all combos)
-            if (filterStatus === 'banned') {
-                userList = userList.filter(u => u.isBanned);
-            } else if (filterStatus === 'active') {
-                userList = userList.filter(u => !u.isBanned);
-            }
-
-            // Exclude System Accounts
-            userList = userList.filter(u => u.displayName !== "Gemini AI");
-
-            if (!term) {
-                if (snapshot.docs.length < DOCUMENTS_PER_PAGE) {
-                    setHasMore(false);
-                }
-                setLastDoc(snapshot.docs[snapshot.docs.length - 1]);
-            }
-
-            if (isNextPage && !term) {
-                setUsers(prev => {
-                    const combined = [...prev, ...userList];
-                    const unique = Array.from(new Map(combined.map(item => [item.id, item])).values());
-                    setFilteredUsers(unique);
-                    return unique;
-                });
-            } else {
-                setUsers(userList);
-                setFilteredUsers(userList);
-            }
-        } catch (error) {
-            console.error("Error fetching users:", error);
+            setUsers(res.users);
+            setTotalCount(res.totalCount);
+        } catch (err) {
+            console.error('[UserRegistry] Fetch error:', err);
         } finally {
             setLoading(false);
         }
+    }, [page, pageSize, debouncedSearch, roleFilter, statusFilter, sortBy, sortOrder]);
+
+    useEffect(() => {
+        fetchUsers();
+    }, [fetchUsers]);
+
+    // Selection Handlers
+    const handleSelectAll = (e) => {
+        if (e.target.checked) {
+            setSelectedIds(new Set(users.map(u => u.id)));
+        } else {
+            setSelectedIds(new Set());
+        }
     };
 
+    const handleToggleSelect = (id) => {
+        const next = new Set(selectedIds);
+        if (next.has(id)) {
+            next.delete(id);
+        } else {
+            next.add(id);
+        }
+        setSelectedIds(next);
+    };
 
+    // Sort toggle
+    const handleSort = (column) => {
+        if (sortBy === column) {
+            setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
+        } else {
+            setSortBy(column);
+            setSortOrder('desc');
+        }
+        setPage(1);
+    };
 
-    if (selectedChat) {
-        return <SpyChatViewer chatId={selectedChat} onClose={() => setSelectedChat(null)} />;
-    }
+    // Single Actions
+    const handleBanToggle = (user) => {
+        const willBan = !user.is_banned;
+        setConfirmModal({
+            isOpen: true,
+            title: willBan ? 'Restrict User Account' : 'Restore User Account',
+            message: willBan
+                ? `Are you sure you want to ban ${user.display_name || user.email}? They will immediately lose access to the platform.`
+                : `Are you sure you want to lift the ban on ${user.display_name || user.email}?`,
+            confirmText: willBan ? 'Ban Account' : 'Unban Account',
+            isDestructive: willBan,
+            requirePhrase: null,
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                try {
+                    await adminService.banUser(user.id, willBan, currentUser);
+                    fetchUsers();
+                } catch (err) {
+                    alert('Action failed: ' + err.message);
+                }
+            }
+        });
+    };
+
+    const handleAccountErasure = (user) => {
+        setConfirmModal({
+            isOpen: true,
+            title: 'Permanent Account Erasure',
+            message: `CRITICAL ACTION: This will permanently delete ${user.display_name || user.email}'s Supabase Auth user, profile, personal messages, attachments in storage, contacts, and call history. This action CANNOT be undone.`,
+            confirmText: 'Permanently Erase Account',
+            isDestructive: true,
+            requirePhrase: 'PURGE',
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                setBulkProcessing(true);
+                setProcessingText('Executing atomic account erasure...');
+                try {
+                    await adminService.eraseUser(user.id, currentUser);
+                    alert(`Account ${user.email} successfully purged.`);
+                    fetchUsers();
+                } catch (err) {
+                    alert('Erasure failed: ' + err.message);
+                } finally {
+                    setBulkProcessing(false);
+                }
+            }
+        });
+    };
+
+    // Bulk Actions
+    const handleBulkBan = (willBan) => {
+        const ids = Array.from(selectedIds);
+        setConfirmModal({
+            isOpen: true,
+            title: willBan ? 'Bulk Ban Users' : 'Bulk Restore Users',
+            message: `Are you sure you want to ${willBan ? 'ban' : 'unban'} ${ids.length} selected user accounts?`,
+            confirmText: willBan ? 'Ban Selected' : 'Unban Selected',
+            isDestructive: willBan,
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                setBulkProcessing(true);
+                setProcessingText(`${willBan ? 'Banning' : 'Restoring'} accounts...`);
+                try {
+                    await adminService.bulkBanUsers(ids, willBan, currentUser);
+                    setSelectedIds(new Set());
+                    fetchUsers();
+                } catch (err) {
+                    alert('Bulk action failed: ' + err.message);
+                } finally {
+                    setBulkProcessing(false);
+                }
+            }
+        });
+    };
+
+    const handleBulkErasure = () => {
+        const ids = Array.from(selectedIds);
+        setConfirmModal({
+            isOpen: true,
+            title: 'Bulk Permanent Account Erasure',
+            message: `DANGER: You are about to permanently erase ${ids.length} user accounts and all associated messages, storage media, and authentication identities.`,
+            confirmText: 'Erase Selected Accounts',
+            isDestructive: true,
+            requirePhrase: 'CONFIRM DELETION',
+            onConfirm: async () => {
+                setConfirmModal(prev => ({ ...prev, isOpen: false }));
+                setBulkProcessing(true);
+                setProcessingText(`Erasing ${ids.length} accounts in batch...`);
+                try {
+                    const result = await adminService.bulkEraseUsers(ids, currentUser);
+                    alert(`Bulk Erasure Complete: ${result.success_count} succeeded, ${result.fail_count} failed.`);
+                    setSelectedIds(new Set());
+                    fetchUsers();
+                } catch (err) {
+                    alert('Bulk erasure failed: ' + err.message);
+                } finally {
+                    setBulkProcessing(false);
+                }
+            }
+        });
+    };
+
+    // Safe CSV export
+    const handleExportCSV = () => {
+        const headers = ['User ID', 'Display Name', 'Email', 'Role', 'Status', 'Registered At'];
+        const rows = users.map(u => [
+            u.id,
+            `"${(u.display_name || '').replace(/"/g, '""')}"`,
+            u.email || '',
+            u.role || 'user',
+            u.is_banned ? 'Banned' : 'Active',
+            u.created_at || ''
+        ]);
+
+        const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+        const encodedUri = encodeURI(csvContent);
+        const link = document.createElement('a');
+        link.setAttribute('href', encodedUri);
+        link.setAttribute('download', `novachat_users_page_${page}.csv`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    };
+
+    const isAllSelected = users.length > 0 && selectedIds.size === users.length;
 
     return (
-        <div className="p-6 h-full overflow-y-auto custom-scrollbar bg-gray-50 dark:bg-[#111827]">
-            {/* Header Section */}
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
-                <div>
-                    <h2 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
-                        User Registry
-                        <span className="text-xs font-normal text-gray-500 bg-gray-200 dark:bg-gray-800 px-2 py-0.5 rounded-full">
-                            {users.length} Users Loaded
-                        </span>
-                    </h2>
-                    <p className="text-sm text-gray-500 mt-1">Manage platform participants, permissions, and security.</p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                    <button
-                        onClick={() => fetchUsers(false)}
-                        className="p-2 text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-gray-800 rounded-lg hover:text-indigo-600 transition-colors shadow-sm border border-transparent hover:border-gray-200 dark:hover:border-gray-700"
-                        title="Refresh List"
-                    >
-                        <RefreshCw size={18} className={loading ? "animate-spin" : ""} />
-                    </button>
-                    <button
-                        onClick={async () => {
-                            try {
-                                const syncFn = httpsCallable(functions, 'syncAdminClaims');
-                                const res = await syncFn();
-                                if (currentUser && res.data.success) {
-                                    await currentUser.getIdToken(true);
-                                    alert("Identity Sync Complete.");
-                                } else {
-                                    alert(res.data.message);
-                                }
-                            } catch (e) { alert("Sync Failed: " + e.message); }
-                        }}
-                        className="px-4 py-2 bg-white dark:bg-[#1f2937] text-gray-700 dark:text-gray-300 text-xs font-bold rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors border border-gray-200 dark:border-gray-700 shadow-sm"
-                    >
-                        Sync Claims
-                    </button>
-                </div>
-            </div>
-
-            {/* Toolbar */}
-            <div className="bg-white dark:bg-[#1f2937] p-4 rounded-xl shadow-sm border border-gray-200 dark:border-gray-800 mb-6 flex flex-col md:flex-row gap-4 items-center justify-between">
-
-                {/* Search */}
-                <div className="relative w-full md:w-96">
-                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" size={18} />
-                    <input
-                        type="text"
-                        placeholder="Search users by name, email, or ID..."
-                        value={searchTerm}
-                        onChange={(e) => setSearchTerm(e.target.value)}
-                        className="w-full pl-10 pr-4 py-2 bg-gray-50 dark:bg-gray-800 border-none rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 transition-all"
-                    />
-                </div>
-
-                {/* Filters */}
-                <div className="flex bg-gray-100 dark:bg-gray-800 p-1 rounded-lg">
-                    {['all', 'active', 'banned'].map(status => (
-                        <button
-                            key={status}
-                            onClick={() => setFilterStatus(status)}
-                            className={`px-4 py-1.5 rounded-md text-xs font-bold uppercase transition-all ${filterStatus === status
-                                ? 'bg-white dark:bg-[#1f2937] text-indigo-600 shadow-sm'
-                                : 'text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
-                                }`}
-                        >
-                            {status}
-                        </button>
-                    ))}
-                </div>
-            </div>
-
-            {/* Table Area */}
-            <div className="bg-white dark:bg-[#1f2937] border border-gray-200 dark:border-gray-800 rounded-2xl shadow-sm flex-1 overflow-hidden flex flex-col min-h-0 relative">
-                <div className="overflow-x-auto custom-scrollbar flex-1 relative scroll-smooth">
-                    {/* Horizontal Scroll Hint (Visible on mobile when scrollable) */}
-                    <div className="lg:hidden absolute top-2 right-2 z-20 pointer-events-none">
-                        <div className="flex items-center gap-1.5 px-3 py-1 bg-black/60 backdrop-blur-md rounded-full text-white text-[10px] font-bold animate-bounce">
-                            <span>Swipe</span>
-                            <MoreHorizontal size={12} />
-                        </div>
+        <div className="flex flex-col h-full bg-slate-50 dark:bg-slate-950 overflow-hidden w-full">
+            {/* Header & Controls Area */}
+            <div className="p-3 sm:p-6 pb-3 sm:pb-4 space-y-3 sm:space-y-4 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shrink-0">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+                    <div className="min-w-0">
+                        <h2 className="text-base sm:text-xl font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2 truncate">
+                            <span>User Registry</span>
+                            <span className="text-xs font-semibold text-slate-500 bg-slate-100 dark:bg-slate-800 px-2.5 py-0.5 rounded-full shrink-0">
+                                {totalCount} Total
+                            </span>
+                        </h2>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 truncate">
+                            Search, filter, inspect, and moderate all platform user accounts.
+                        </p>
                     </div>
 
-                    <table className="w-full text-left border-collapse min-w-[1000px] relative">
-                        <thead className="sticky top-0 z-10 bg-gray-50 dark:bg-[#111827] ring-1 ring-gray-100 dark:ring-gray-800">
-                            <tr className="border-b border-gray-100 dark:border-gray-800">
-                                <th className="p-5 w-12 text-center">
-                                    <input type="checkbox" className="rounded-md border-gray-300 text-indigo-600 focus:ring-indigo-500 bg-transparent transition-all" />
-                                </th>
-                                <th className="p-5 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Platform Identity</th>
-                                <th className="p-5 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Neural Uplink</th>
-                                <th className="p-5 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Telemetry</th>
-                                <th className="p-5 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em]">Clearance</th>
-                                <th className="p-5 text-[10px] font-black text-gray-400 dark:text-gray-500 uppercase tracking-[0.2em] text-right">Direct Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-gray-50 dark:divide-gray-800/50">
-                            {filteredUsers.map((user) => (
-                                <tr
-                                    key={user.id}
-                                    onClick={() => onOpenDossier(user)}
-                                    className="group hover:bg-gray-50/50 dark:hover:bg-indigo-900/10 transition-all cursor-pointer relative"
-                                >
-                                    <td className="p-5 text-center" onClick={(e) => e.stopPropagation()}>
-                                        <input type="checkbox" className="rounded-md border-gray-300 text-indigo-600 focus:ring-indigo-500 bg-transparent" />
-                                    </td>
-                                    <td className="p-5">
-                                        <div className="flex items-center gap-4">
-                                            <div className="relative flex-shrink-0">
-                                                <div className="absolute -inset-1 bg-gradient-to-tr from-indigo-500 to-purple-500 rounded-full opacity-0 group-hover:opacity-20 blur-sm transition-opacity" />
-                                                <Avatar
-                                                    src={user.photoURL}
-                                                    alt={user.displayName}
-                                                    fallback={user.displayName?.[0]}
-                                                    className="w-11 h-11 rounded-full border-2 border-white dark:border-gray-800 shadow-sm relative z-10"
-                                                />
-                                                {user.isOnline && (
-                                                    <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-[3px] border-white dark:border-[#1f2937] z-20" />
-                                                )}
-                                            </div>
-                                            <div className="min-w-0">
-                                                <h4 className="font-bold text-gray-800 dark:text-gray-100 text-sm group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors truncate">
-                                                    {user.displayName || 'Anonymous'}
-                                                </h4>
-                                                <div className="flex items-center gap-2 mt-0.5">
-                                                    <span className="text-[10px] font-mono font-bold text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-1.5 py-0.5 rounded tracking-tighter">
-                                                        UID: {user.id.slice(0, 8)}
-                                                    </span>
-                                                    {user.isAdmin && (
-                                                        <span className="text-[9px] font-black bg-indigo-100 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 px-1.5 py-0.5 rounded-full uppercase tracking-tighter">Admin</span>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        </div>
-                                    </td>
-                                    <td className="p-5">
-                                        <div className="space-y-0.5">
-                                            <div className="text-[13px] font-medium text-gray-600 dark:text-gray-300 truncate max-w-[180px]">{user.email || 'Encrypted Channel'}</div>
-                                            <div className="text-[11px] font-bold text-gray-400 dark:text-gray-500">{user.phoneNumber || 'Secondary Link'}</div>
-                                        </div>
-                                    </td>
-                                    <td className="p-5">
-                                        <div className="flex flex-col gap-1">
-                                            <div className="text-[11px] font-bold text-gray-500 dark:text-gray-400 flex items-center gap-1.5 uppercase tracking-wide">
-                                                <div className={`w-1.5 h-1.5 rounded-full ${user.isOnline ? 'bg-green-500' : 'bg-gray-300'}`} />
-                                                {user.isOnline ? 'Active' : 'Offline'}
-                                            </div>
-                                            <div className="text-[10px] text-gray-400 font-medium">
-                                                {user.lastSeen?.toDate ? format(user.lastSeen.toDate(), 'dd MMM yyyy · HH:mm') : 'Connection Lost'}
-                                            </div>
-                                            {locations[user.id] === 'NA' ? (
-                                                <div className="text-[9px] text-gray-400 font-bold uppercase">No Telemetry</div>
-                                            ) : locations[user.id] ? (
-                                                <a
-                                                    href={`https://www.google.com/maps?q=${locations[user.id].lat},${locations[user.id].lng}`}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    onClick={(e) => e.stopPropagation()}
-                                                    className="inline-flex items-center gap-1 text-[9px] font-bold text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 mt-1 transition-colors"
-                                                >
-                                                    <MapPin size={10} />
-                                                    Pin: {locations[user.id].lat.toFixed(4)}, {locations[user.id].lng.toFixed(4)}
-                                                </a>
-                                            ) : (
-                                                <button
-                                                    onClick={(e) => {
-                                                        e.stopPropagation();
-                                                        fetchLocation(user.id);
-                                                    }}
-                                                    className="text-[9px] font-black text-indigo-600 dark:text-indigo-400 hover:underline uppercase tracking-tighter"
-                                                    disabled={fetchingLocation[user.id]}
-                                                >
-                                                    {fetchingLocation[user.id] ? 'Linking...' : 'Recover Loc'}
-                                                </button>
-                                            )}
-                                        </div>
-                                    </td>
-                                    <td className="p-5">
-                                        <div className={`
-                                            inline-flex items-center px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border
-                                            ${user.isBanned
-                                                ? 'bg-red-50 dark:bg-red-900/10 text-red-600 dark:text-red-400 border-red-100 dark:border-red-900/30 shadow-sm'
-                                                : 'bg-emerald-50 dark:bg-emerald-900/10 text-emerald-600 dark:text-emerald-400 border-emerald-100 dark:border-emerald-900/30'
-                                            }
-                                        `}>
-                                            <span className="mr-1.5 text-xs">{user.isBanned ? '⚠️' : '🛡️'}</span>
-                                            {user.isBanned ? 'Banned' : 'Verified'}
-                                        </div>
-                                    </td>
-                                    <td className="p-5 text-right" onClick={(e) => e.stopPropagation()}>
-                                        <div className="flex items-center justify-end gap-2 opacity-0 group-hover:opacity-100 transition-all duration-300 translate-x-1 group-hover:translate-x-0">
-                                            <button
-                                                onClick={() => onBan(user.id, user.isBanned)}
-                                                className={`
-                                                    w-9 h-9 rounded-xl flex items-center justify-center transition-all active:scale-95
-                                                    ${user.isBanned
-                                                        ? 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-900/20 dark:hover:bg-emerald-900/30'
-                                                        : 'bg-amber-50 text-amber-600 hover:bg-amber-100 dark:bg-amber-900/20 dark:hover:bg-amber-900/30'
-                                                    }
-                                                `}
-                                                title={user.isBanned ? "Unban" : "Ban"}
-                                            >
-                                                {user.isBanned ? <Shield size={18} /> : <ShieldAlert size={18} />}
-                                            </button>
-                                            <button
-                                                onClick={() => setSelectedChat(user.id)}
-                                                className="w-9 h-9 bg-indigo-50 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 rounded-xl flex items-center justify-center transition-all active:scale-95 shadow-sm"
-                                                title="View Chats"
-                                            >
-                                                <Eye size={18} />
-                                            </button>
-                                            {locations[user.id] && (
-                                                <a
-                                                    href={`https://www.google.com/maps?q=${locations[user.id].lat},${locations[user.id].lng}`}
-                                                    target="_blank"
-                                                    rel="noopener noreferrer"
-                                                    onClick={(e) => e.stopPropagation()}
-                                                    className="w-9 h-9 bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 rounded-xl flex items-center justify-center transition-all active:scale-95 shadow-sm"
-                                                    title="View on Google Maps"
-                                                >
-                                                    <ExternalLink size={16} />
-                                                </a>
-                                            )}
-                                            <button
-                                                onClick={() => {
-                                                    const confirmed = window.confirm(
-                                                        "CRITICAL ACTION REQUIRED!\n\n" +
-                                                        "You are about to execute the NUKE sequence for this user.\n" +
-                                                        "This will PERMANENTLY ERADICATE:\n" +
-                                                        "- Auth Account\n" +
-                                                        "- All Sent Messages (Group & Private)\n" +
-                                                        "- All Media Assets (Images/Status)\n" +
-                                                        "- Global Telemetry & Friend Links\n\n" +
-                                                        "THIS ACTION CANNOT BE UNDONE.\n" +
-                                                        "Continue with vaporization?"
-                                                    );
-                                                    if (confirmed) onNuke(user.id);
-                                                }}
-                                                className="w-9 h-9 bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-xl flex items-center justify-center transition-all active:scale-95 shadow-sm"
-                                                title="Nuke User"
-                                            >
-                                                {nuking === user.id ? (
-                                                    <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
-                                                ) : (
-                                                    <Trash2 size={18} />
-                                                )}
-                                            </button>
-                                        </div>
-                                    </td>
-                                </tr>
-                            ))}
-
-                            {(loading || filteredUsers.length === 0) && (
-                                <tr>
-                                    <td colSpan="6" className="p-20 text-center">
-                                        {loading ? (
-                                            <div className="flex flex-col items-center gap-4">
-                                                <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin" />
-                                                <span className="text-xs font-black uppercase tracking-[0.2em] text-gray-400">Syncing Neurons...</span>
-                                            </div>
-                                        ) : (
-                                            <div className="space-y-2 opacity-50">
-                                                <div className="text-4xl">🔎</div>
-                                                <div className="text-sm font-bold text-gray-500 mt-4 uppercase tracking-widest">No Matches Found</div>
-                                                <p className="text-xs text-gray-400">Try adjusting your search filters</p>
-                                            </div>
-                                        )}
-                                    </td>
-                                </tr>
-                            )}
-                        </tbody>
-                    </table>
-
-                    {hasMore && !loading && !searchTerm && (
-                        <div className="p-8 flex justify-center border-t border-gray-50 dark:border-gray-800/50 bg-gray-50/20 dark:bg-[#111827]/30">
-                            <button
-                                onClick={() => fetchUsers(true)}
-                                className="px-6 py-2.5 rounded-xl bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-indigo-600 dark:text-indigo-400 text-xs font-black uppercase tracking-[0.2em] hover:bg-gray-50 dark:hover:bg-gray-700 hover:shadow-lg transition-all active:scale-95 shadow-sm"
-                            >
-                                Re-Link Data Points
-                            </button>
-                        </div>
-                    )}
+                    <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                        <button
+                            onClick={handleExportCSV}
+                            className="px-3 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                            title="Export current page to CSV"
+                        >
+                            <Download size={14} />
+                            <span className="hidden sm:inline">Export Page</span>
+                        </button>
+                        <button
+                            onClick={fetchUsers}
+                            disabled={loading}
+                            className="p-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-xl transition-colors"
+                            title="Refresh users"
+                        >
+                            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+                        </button>
+                    </div>
                 </div>
+
+                {/* Filter and Search Bar */}
+                <div className="flex flex-col sm:flex-row gap-2 sm:gap-3">
+                    {/* Search */}
+                    <div className="relative flex-1 min-w-0">
+                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={15} />
+                        <input
+                            type="text"
+                            placeholder="Search by name, email, or user ID..."
+                            value={searchTerm}
+                            onChange={(e) => setSearchTerm(e.target.value)}
+                            className="w-full pl-9 pr-4 py-2 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-all shadow-sm"
+                        />
+                    </div>
+
+                    {/* Role & Status Filter */}
+                    <div className="grid grid-cols-2 sm:flex sm:items-center gap-2 shrink-0">
+                        <select
+                            value={roleFilter}
+                            onChange={(e) => {
+                                setRoleFilter(e.target.value);
+                                setPage(1);
+                            }}
+                            className="px-3 py-2 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-700 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+                        >
+                            <option value="all">All Roles</option>
+                            <option value="user">User</option>
+                            <option value="admin">Admin</option>
+                            <option value="superAdmin">SuperAdmin</option>
+                        </select>
+
+                        <select
+                            value={statusFilter}
+                            onChange={(e) => {
+                                setStatusFilter(e.target.value);
+                                setPage(1);
+                            }}
+                            className="px-3 py-2 bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-xl text-xs text-slate-700 dark:text-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+                        >
+                            <option value="all">All Statuses</option>
+                            <option value="active">Active Only</option>
+                            <option value="banned">Banned Only</option>
+                            <option value="deletion_requested">Deletion Requested</option>
+                        </select>
+                    </div>
+                </div>
+
+                {/* Bulk Action Toolbar */}
+                <BulkActionToolbar
+                    selectedCount={selectedIds.size}
+                    onClearSelection={() => setSelectedIds(new Set())}
+                    processing={bulkProcessing}
+                    processingText={processingText}
+                >
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button
+                            onClick={() => handleBulkBan(true)}
+                            className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 dark:hover:bg-amber-900/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-800 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors"
+                        >
+                            <UserX size={13} /> Ban Selected
+                        </button>
+                        <button
+                            onClick={() => handleBulkBan(false)}
+                            className="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:hover:bg-emerald-900/40 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors"
+                        >
+                            <UserCheck size={13} /> Unban Selected
+                        </button>
+                        <button
+                            onClick={handleBulkErasure}
+                            className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors shadow-sm"
+                        >
+                            <Trash2 size={13} /> Purge Selected
+                        </button>
+                    </div>
+                </BulkActionToolbar>
             </div>
 
+            {/* Desktop Table View (Hidden on mobile < md) */}
+            <div className="hidden md:block flex-1 overflow-auto custom-scrollbar">
+                <table className="w-full text-left border-collapse min-w-[760px]">
+                    <thead className="sticky top-0 z-10 bg-slate-100 dark:bg-slate-900 text-slate-600 dark:text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-slate-200 dark:border-slate-800">
+                        <tr>
+                            <th className="py-3 px-4 w-10">
+                                <input
+                                    type="checkbox"
+                                    checked={isAllSelected}
+                                    onChange={handleSelectAll}
+                                    className="w-4 h-4 rounded text-indigo-600 border-slate-300 dark:border-slate-700 focus:ring-indigo-500 cursor-pointer"
+                                />
+                            </th>
+                            <th className="py-3 px-4 cursor-pointer hover:text-slate-900 dark:hover:text-slate-200 transition-colors" onClick={() => handleSort('display_name')}>
+                                <div className="flex items-center gap-1.5">
+                                    <span>User</span>
+                                    <ArrowUpDown size={12} />
+                                </div>
+                            </th>
+                            <th className="py-3 px-4 cursor-pointer hover:text-slate-900 dark:hover:text-slate-200 transition-colors" onClick={() => handleSort('email')}>
+                                <div className="flex items-center gap-1.5">
+                                    <span>Email</span>
+                                    <ArrowUpDown size={12} />
+                                </div>
+                            </th>
+                            <th className="py-3 px-4">Role</th>
+                            <th className="py-3 px-4">Status</th>
+                            <th className="py-3 px-4 cursor-pointer hover:text-slate-900 dark:hover:text-slate-200 transition-colors" onClick={() => handleSort('created_at')}>
+                                <div className="flex items-center gap-1.5">
+                                    <span>Registered</span>
+                                    <ArrowUpDown size={12} />
+                                </div>
+                            </th>
+                            <th className="py-3 px-4 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 dark:divide-slate-800 text-xs">
+                        {loading && users.length === 0 ? (
+                            <tr>
+                                <td colSpan={7} className="p-8 text-center text-slate-400">
+                                    <div className="flex flex-col items-center justify-center gap-2">
+                                        <RefreshCw size={20} className="animate-spin text-indigo-500" />
+                                        <span>Loading user directory...</span>
+                                    </div>
+                                </td>
+                            </tr>
+                        ) : users.length === 0 ? (
+                            <tr>
+                                <td colSpan={7} className="p-12 text-center text-slate-400">
+                                    <p className="font-semibold text-sm text-slate-600 dark:text-slate-400">No users found</p>
+                                    <p className="text-xs text-slate-400 mt-1">Try adjusting your search terms or filters.</p>
+                                </td>
+                            </tr>
+                        ) : (
+                            users.map((user) => {
+                                const isSelected = selectedIds.has(user.id);
+                                return (
+                                    <tr
+                                        key={user.id}
+                                        onClick={() => onOpenDossier && onOpenDossier(user)}
+                                        className={`group cursor-pointer hover:bg-slate-100/60 dark:hover:bg-slate-800/40 transition-colors ${
+                                            isSelected ? 'bg-indigo-50/50 dark:bg-indigo-950/20' : ''
+                                        }`}
+                                    >
+                                        {/* Checkbox */}
+                                        <td className="py-3.5 px-4" onClick={(e) => e.stopPropagation()}>
+                                            <input
+                                                type="checkbox"
+                                                checked={isSelected}
+                                                onChange={() => handleToggleSelect(user.id)}
+                                                className="w-4 h-4 rounded text-indigo-600 border-slate-300 dark:border-slate-700 focus:ring-indigo-500 cursor-pointer"
+                                            />
+                                        </td>
+
+                                        {/* User Identity */}
+                                        <td className="py-3.5 px-4">
+                                            <div className="flex items-center gap-3">
+                                                <Avatar
+                                                    src={user.avatar_url}
+                                                    alt={user.display_name}
+                                                    fallback={user.display_name?.[0]}
+                                                    size="sm"
+                                                    className="w-8 h-8 rounded-full border border-slate-200 dark:border-slate-700 shrink-0"
+                                                />
+                                                <div className="min-w-0">
+                                                    <p className="font-semibold text-slate-900 dark:text-slate-100 truncate group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors">
+                                                        {user.display_name || 'Anonymous User'}
+                                                    </p>
+                                                    <p className="text-[10px] text-slate-400 font-mono truncate">
+                                                        {user.id}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </td>
+
+                                        {/* Email */}
+                                        <td className="py-3.5 px-4 text-slate-600 dark:text-slate-300">
+                                            <span className="truncate block max-w-[200px]">{user.email || '—'}</span>
+                                        </td>
+
+                                        {/* Role */}
+                                        <td className="py-3.5 px-4">
+                                            <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                                                user.role === 'admin' || user.role === 'superAdmin'
+                                                    ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800'
+                                                    : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400'
+                                            }`}>
+                                                {user.role || 'user'}
+                                            </span>
+                                        </td>
+
+                                        {/* Status */}
+                                        <td className="py-3.5 px-4">
+                                            {user.is_banned ? (
+                                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-900/40">
+                                                    Banned
+                                                </span>
+                                            ) : user.deletion_requested ? (
+                                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-50 dark:bg-amber-950/50 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-900/40">
+                                                    Deletion Req
+                                                </span>
+                                            ) : (
+                                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900/40">
+                                                    Active
+                                                </span>
+                                            )}
+                                        </td>
+
+                                        {/* Registered Date */}
+                                        <td className="py-3.5 px-4 text-slate-500">
+                                            {user.created_at ? format(new Date(user.created_at), 'MMM dd, yyyy') : '—'}
+                                        </td>
+
+                                        {/* Actions */}
+                                        <td className="py-3.5 px-4 text-right" onClick={(e) => e.stopPropagation()}>
+                                            <div className="flex items-center justify-end gap-1.5">
+                                                <button
+                                                    onClick={() => handleBanToggle(user)}
+                                                    className={`p-1.5 rounded-lg border transition-colors ${
+                                                        user.is_banned
+                                                            ? 'border-emerald-200 text-emerald-600 hover:bg-emerald-50'
+                                                            : 'border-amber-200 text-amber-600 hover:bg-amber-50'
+                                                    }`}
+                                                    title={user.is_banned ? 'Restore User' : 'Ban User'}
+                                                >
+                                                    {user.is_banned ? <UserCheck size={14} /> : <UserX size={14} />}
+                                                </button>
+                                                <button
+                                                    onClick={() => handleAccountErasure(user)}
+                                                    className="p-1.5 rounded-lg border border-rose-200 text-rose-600 hover:bg-rose-50 dark:border-rose-900/50 dark:text-rose-400 dark:hover:bg-rose-950/40 transition-colors"
+                                                    title="Permanently Erase Account"
+                                                >
+                                                    <Trash2 size={14} />
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                );
+                            })
+                        )}
+                    </tbody>
+                </table>
+            </div>
+
+            {/* Mobile Card Stream View (Shown on screens < md) */}
+            <div className="block md:hidden flex-1 overflow-y-auto p-3 space-y-3 custom-scrollbar">
+                {loading && users.length === 0 ? (
+                    <div className="text-center py-12 text-slate-400 text-xs">
+                        <RefreshCw size={20} className="animate-spin mx-auto text-indigo-500 mb-2" />
+                        <span>Loading user directory...</span>
+                    </div>
+                ) : users.length === 0 ? (
+                    <div className="text-center py-12 text-slate-400">
+                        <p className="font-semibold text-sm text-slate-600 dark:text-slate-400">No users found</p>
+                        <p className="text-xs text-slate-400 mt-1">Try adjusting your search terms or filters.</p>
+                    </div>
+                ) : (
+                    users.map((user) => {
+                        const isSelected = selectedIds.has(user.id);
+                        return (
+                            <div
+                                key={user.id}
+                                className={`bg-white dark:bg-slate-900 border rounded-2xl p-4 shadow-sm space-y-3 transition-colors ${
+                                    isSelected
+                                        ? 'border-indigo-500 bg-indigo-50/20 dark:bg-indigo-950/20'
+                                        : 'border-slate-200 dark:border-slate-800'
+                                }`}
+                            >
+                                {/* User Info Header */}
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="flex items-center gap-3 min-w-0">
+                                        <input
+                                            type="checkbox"
+                                            checked={isSelected}
+                                            onChange={() => handleToggleSelect(user.id)}
+                                            className="w-4 h-4 rounded text-indigo-600 border-slate-300 dark:border-slate-700 focus:ring-indigo-500 cursor-pointer shrink-0"
+                                        />
+                                        <Avatar
+                                            src={user.avatar_url}
+                                            alt={user.display_name}
+                                            fallback={user.display_name?.[0]}
+                                            size="sm"
+                                            className="w-9 h-9 rounded-full border border-slate-200 dark:border-slate-700 shrink-0"
+                                        />
+                                        <div className="min-w-0">
+                                            <p className="font-bold text-xs text-slate-900 dark:text-slate-100 truncate">
+                                                {user.display_name || 'Anonymous User'}
+                                            </p>
+                                            <p className="text-[11px] text-slate-500 truncate">
+                                                {user.email || 'No email registered'}
+                                            </p>
+                                        </div>
+                                    </div>
+
+                                    {/* Status Badge */}
+                                    <div className="shrink-0">
+                                        {user.is_banned ? (
+                                            <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-rose-50 text-rose-600 dark:bg-rose-950/60 dark:text-rose-400 border border-rose-200 dark:border-rose-900/50">
+                                                Banned
+                                            </span>
+                                        ) : user.deletion_requested ? (
+                                            <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-amber-50 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400 border border-amber-200 dark:border-amber-900/50">
+                                                Deletion Req
+                                            </span>
+                                        ) : (
+                                            <span className="inline-flex px-2 py-0.5 rounded-full text-[10px] font-bold uppercase bg-emerald-50 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-900/50">
+                                                Active
+                                            </span>
+                                        )}
+                                    </div>
+                                </div>
+
+                                {/* Metadata Row */}
+                                <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-100 dark:border-slate-800">
+                                    <span>Role: <strong className="text-slate-700 dark:text-slate-300 uppercase">{user.role || 'user'}</strong></span>
+                                    <span>Joined: {user.created_at ? format(new Date(user.created_at), 'MMM dd, yyyy') : '—'}</span>
+                                </div>
+
+                                {/* Action Buttons */}
+                                <div className="flex items-center justify-between gap-2 pt-1">
+                                    <button
+                                        onClick={() => onOpenDossier && onOpenDossier(user)}
+                                        className="flex-1 py-1.5 px-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-semibold flex items-center justify-center gap-1 transition-colors"
+                                    >
+                                        <Eye size={13} />
+                                        <span>Dossier</span>
+                                    </button>
+
+                                    <button
+                                        onClick={() => handleBanToggle(user)}
+                                        className={`py-1.5 px-3 rounded-xl text-xs font-semibold flex items-center gap-1 transition-colors ${
+                                            user.is_banned
+                                                ? 'bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 border border-emerald-200'
+                                                : 'bg-amber-50 text-amber-600 dark:bg-amber-950/40 border border-amber-200'
+                                        }`}
+                                    >
+                                        {user.is_banned ? <UserCheck size={13} /> : <UserX size={13} />}
+                                        <span>{user.is_banned ? 'Unban' : 'Ban'}</span>
+                                    </button>
+
+                                    <button
+                                        onClick={() => handleAccountErasure(user)}
+                                        className="p-1.5 rounded-xl bg-rose-50 text-rose-600 dark:bg-rose-950/40 border border-rose-200 hover:bg-rose-100 transition-colors"
+                                        title="Purge Account"
+                                    >
+                                        <Trash2 size={14} />
+                                    </button>
+                                </div>
+                            </div>
+                        );
+                    })
+                )}
+            </div>
+
+            {/* Pagination Component */}
+            <Pagination
+                page={page}
+                pageSize={pageSize}
+                totalCount={totalCount}
+                onPageChange={setPage}
+                onPageSizeChange={setPageSize}
+                loading={loading}
+            />
+
+            {/* Destructive / Action Confirm Modal */}
+            <ConfirmModal
+                isOpen={confirmModal.isOpen}
+                title={confirmModal.title}
+                message={confirmModal.message}
+                confirmText={confirmModal.confirmText}
+                isDestructive={confirmModal.isDestructive}
+                requirePhrase={confirmModal.requirePhrase}
+                onConfirm={confirmModal.onConfirm}
+                onCancel={() => setConfirmModal(prev => ({ ...prev, isOpen: false }))}
+            />
         </div>
     );
 };
