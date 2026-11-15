@@ -78,7 +78,7 @@ export const userService = {
             user_id: currentUserId,
             contact_user_id: targetUserId,
             status: 'blocked'
-        });
+        }, { onConflict: 'user_id,contact_user_id' });
     },
 
     unblockUser: async (currentUserId, targetUserId) => {

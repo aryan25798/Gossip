@@ -15,6 +15,7 @@ export function FriendProvider({ children }) {
     const [friends, setFriends] = useState([]); // array of friend user IDs: string[]
     const [incomingRequests, setIncomingRequests] = useState([]); // array of { id, fromId, fromName, fromPhoto }
     const [outgoingRequests, setOutgoingRequests] = useState([]); // array of target user IDs: string[]
+    const [blockedUsers, setBlockedUsers] = useState([]); // array of blocked target user IDs: string[]
     const [loading, setLoading] = useState(false);
     const [actionLoading, setActionLoading] = useState(null);
 
@@ -23,6 +24,7 @@ export function FriendProvider({ children }) {
             setFriends([]);
             setIncomingRequests([]);
             setOutgoingRequests([]);
+            setBlockedUsers([]);
             return;
         }
 
@@ -43,6 +45,7 @@ export function FriendProvider({ children }) {
             const acceptedFriendIds = new Set();
             const incoming = [];
             const outgoing = [];
+            const blocked = [];
 
             (data || []).forEach(row => {
                 if (row.status === 'accepted') {
@@ -57,6 +60,8 @@ export function FriendProvider({ children }) {
                     } else if (row.user_id === currentUserId) {
                         outgoing.push(row.contact_user_id);
                     }
+                } else if (row.status === 'blocked' && row.user_id === currentUserId) {
+                    blocked.push(row.contact_user_id);
                 }
             });
 
@@ -85,6 +90,7 @@ export function FriendProvider({ children }) {
 
             setFriends(Array.from(acceptedFriendIds));
             setOutgoingRequests(outgoing);
+            setBlockedUsers(blocked);
         } catch (err) {
             console.error("[FriendContext] Load contacts exception:", err);
         } finally {
@@ -121,16 +127,48 @@ export function FriendProvider({ children }) {
     const getFriendStatus = useCallback((targetUserId) => {
         if (!targetUserId || !currentUserId) return 'none';
         if (targetUserId === currentUserId) return 'self';
+        if (blockedUsers.includes(targetUserId)) return 'blocked';
         if (friends.includes(targetUserId)) return 'friend';
         if (outgoingRequests.includes(targetUserId)) return 'sent';
         if (incomingRequests.some(r => r.fromId === targetUserId || r.id === targetUserId)) return 'received';
         return 'none';
-    }, [currentUserId, friends, outgoingRequests, incomingRequests]);
+    }, [currentUserId, blockedUsers, friends, outgoingRequests, incomingRequests]);
 
     const sendRequest = useCallback(async (targetUserId) => {
         if (!currentUserId || !targetUserId || currentUserId === targetUserId) return;
         setActionLoading(targetUserId);
+
+        // Optimistic outgoing update
+        setOutgoingRequests(prev => prev.includes(targetUserId) ? prev : [...prev, targetUserId]);
+
         try {
+            // First check if a relationship already exists
+            const { data: existing } = await supabase
+                .from('contacts')
+                .select('*')
+                .or(`and(user_id.eq.${currentUserId},contact_user_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},contact_user_id.eq.${currentUserId})`);
+
+            if (existing && existing.length > 0) {
+                const row = existing[0];
+                if (row.status === 'accepted') {
+                    setFriends(prev => prev.includes(targetUserId) ? prev : [...prev, targetUserId]);
+                    setOutgoingRequests(prev => prev.filter(id => id !== targetUserId));
+                    return;
+                }
+                if (row.status === 'pending') {
+                    // If target already sent a request to me, automatically accept it!
+                    if (row.contact_user_id === currentUserId) {
+                        await supabase
+                            .from('contacts')
+                            .update({ status: 'accepted' })
+                            .eq('id', row.id);
+                        await loadContacts();
+                        return;
+                    }
+                    return;
+                }
+            }
+
             const { error } = await supabase.from('contacts').insert({
                 user_id: currentUserId,
                 contact_user_id: targetUserId,
@@ -143,58 +181,147 @@ export function FriendProvider({ children }) {
             await loadContacts();
         } catch (e) {
             console.error("[FriendContext] sendRequest failed:", e);
+            await loadContacts();
+            throw e;
         } finally {
             setActionLoading(null);
         }
     }, [currentUserId, loadContacts]);
 
     const acceptRequest = useCallback(async (reqOrId) => {
-        if (!currentUserId) return;
-        const requestId = typeof reqOrId === 'object' ? reqOrId.id : reqOrId;
-        const requesterId = typeof reqOrId === 'object' ? reqOrId.fromId : null;
+        if (!currentUserId || !reqOrId) return;
 
-        setActionLoading(requestId || requesterId);
-        try {
-            let query = supabase.from('contacts').update({ status: 'accepted' });
-            if (requestId) {
-                query = query.eq('id', requestId);
-            } else if (requesterId) {
-                query = query.match({ user_id: requesterId, contact_user_id: currentUserId });
+        let contactRowId = null;
+        let requesterUserId = null;
+
+        if (typeof reqOrId === 'object') {
+            contactRowId = reqOrId.id;
+            requesterUserId = reqOrId.fromId || reqOrId.userId;
+        } else if (typeof reqOrId === 'string') {
+            const matchedReq = incomingRequests.find(r => r.id === reqOrId || r.fromId === reqOrId);
+            if (matchedReq) {
+                contactRowId = matchedReq.id;
+                requesterUserId = matchedReq.fromId;
+            } else {
+                contactRowId = reqOrId;
+                requesterUserId = reqOrId;
             }
-            const { error } = await query;
-            if (error) throw error;
+        }
+
+        const effectiveTarget = requesterUserId || contactRowId;
+        setActionLoading(effectiveTarget);
+
+        // Optimistic update: mark as friend and clear from incoming
+        if (effectiveTarget) {
+            setFriends(prev => prev.includes(effectiveTarget) ? prev : [...prev, effectiveTarget]);
+            setIncomingRequests(prev => prev.filter(r => r.id !== contactRowId && r.fromId !== requesterUserId));
+        }
+
+        try {
+            let updated = false;
+
+            // 1. Try updating by row ID where contact_user_id = currentUserId
+            if (contactRowId) {
+                const { data, error } = await supabase
+                    .from('contacts')
+                    .update({ status: 'accepted' })
+                    .match({ id: contactRowId, contact_user_id: currentUserId })
+                    .select();
+
+                if (!error && data && data.length > 0) {
+                    updated = true;
+                }
+            }
+
+            // 2. Fallback: update by requester user ID where contact_user_id = currentUserId
+            if (!updated && requesterUserId) {
+                const { error } = await supabase
+                    .from('contacts')
+                    .update({ status: 'accepted' })
+                    .match({ user_id: requesterUserId, contact_user_id: currentUserId, status: 'pending' });
+
+                if (error) throw error;
+            }
 
             await loadContacts();
         } catch (e) {
             console.error("[FriendContext] acceptRequest failed:", e);
+            await loadContacts();
+            throw e;
         } finally {
             setActionLoading(null);
         }
-    }, [currentUserId, loadContacts]);
+    }, [currentUserId, incomingRequests, loadContacts]);
 
     const rejectRequest = useCallback(async (reqOrId) => {
-        if (!currentUserId) return;
-        const requestId = typeof reqOrId === 'object' ? reqOrId.id : reqOrId;
+        if (!currentUserId || !reqOrId) return;
 
-        setActionLoading(requestId);
+        let contactRowId = null;
+        let requesterUserId = null;
+
+        if (typeof reqOrId === 'object') {
+            contactRowId = reqOrId.id;
+            requesterUserId = reqOrId.fromId || reqOrId.userId;
+        } else if (typeof reqOrId === 'string') {
+            const matchedReq = incomingRequests.find(r => r.id === reqOrId || r.fromId === reqOrId);
+            if (matchedReq) {
+                contactRowId = matchedReq.id;
+                requesterUserId = matchedReq.fromId;
+            } else {
+                contactRowId = reqOrId;
+                requesterUserId = reqOrId;
+            }
+        }
+
+        const effectiveTarget = requesterUserId || contactRowId;
+        setActionLoading(effectiveTarget);
+
+        // Optimistic update: remove from incoming
+        setIncomingRequests(prev => prev.filter(r => r.id !== contactRowId && r.fromId !== requesterUserId));
+
         try {
-            const { error } = await supabase
-                .from('contacts')
-                .delete()
-                .eq('id', requestId);
-            if (error) throw error;
+            let deleted = false;
+
+            // 1. Try deleting by row ID
+            if (contactRowId) {
+                const { data, error } = await supabase
+                    .from('contacts')
+                    .delete()
+                    .match({ id: contactRowId, contact_user_id: currentUserId })
+                    .select();
+
+                if (!error && data && data.length > 0) {
+                    deleted = true;
+                }
+            }
+
+            // 2. Fallback: delete by requester user ID
+            if (!deleted && requesterUserId) {
+                const { error } = await supabase
+                    .from('contacts')
+                    .delete()
+                    .match({ user_id: requesterUserId, contact_user_id: currentUserId, status: 'pending' });
+
+                if (error) throw error;
+            }
 
             await loadContacts();
         } catch (e) {
             console.error("[FriendContext] rejectRequest failed:", e);
+            await loadContacts();
+            throw e;
         } finally {
             setActionLoading(null);
         }
-    }, [currentUserId, loadContacts]);
+    }, [currentUserId, incomingRequests, loadContacts]);
 
     const cancelRequest = useCallback(async (targetUserId) => {
         if (!currentUserId || !targetUserId) return;
         setActionLoading(targetUserId);
+
+        // Optimistic update
+        setOutgoingRequests(prev => prev.filter(id => id !== targetUserId));
+
         try {
             const { error } = await supabase
                 .from('contacts')
@@ -204,6 +331,8 @@ export function FriendProvider({ children }) {
             await loadContacts();
         } catch (e) {
             console.error("[FriendContext] cancelRequest failed:", e);
+            await loadContacts();
+            throw e;
         } finally {
             setActionLoading(null);
         }
@@ -212,15 +341,90 @@ export function FriendProvider({ children }) {
     const unfriend = useCallback(async (targetUserId) => {
         if (!currentUserId || !targetUserId) return;
         setActionLoading(targetUserId);
+
+        // Optimistic update
+        setFriends(prev => prev.filter(id => id !== targetUserId));
+
+        try {
+            // Delete either direction (currentUserId -> targetUserId OR targetUserId -> currentUserId)
+            await supabase
+                .from('contacts')
+                .delete()
+                .match({ user_id: currentUserId, contact_user_id: targetUserId });
+
+            await supabase
+                .from('contacts')
+                .delete()
+                .match({ user_id: targetUserId, contact_user_id: currentUserId });
+
+            await loadContacts();
+        } catch (e) {
+            console.error("[FriendContext] unfriend failed:", e);
+            await loadContacts();
+            throw e;
+        } finally {
+            setActionLoading(null);
+        }
+    }, [currentUserId, loadContacts]);
+
+    const blockUser = useCallback(async (targetUserId) => {
+        if (!currentUserId || !targetUserId) return;
+        setActionLoading(targetUserId);
+
+        // Optimistic update: remove from friends and add to blocked
+        setFriends(prev => prev.filter(id => id !== targetUserId));
+        setBlockedUsers(prev => prev.includes(targetUserId) ? prev : [...prev, targetUserId]);
+
+        try {
+            // Remove any friendship/pending row
+            await supabase
+                .from('contacts')
+                .delete()
+                .or(`and(user_id.eq.${currentUserId},contact_user_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},contact_user_id.eq.${currentUserId})`);
+
+            // Insert blocked record
+            const { error } = await supabase
+                .from('contacts')
+                .upsert({
+                    user_id: currentUserId,
+                    contact_user_id: targetUserId,
+                    status: 'blocked'
+                }, { onConflict: 'user_id,contact_user_id' });
+
+            if (error) throw error;
+            await loadContacts();
+        } catch (e) {
+            console.error("[FriendContext] blockUser failed:", e);
+            await loadContacts();
+            throw e;
+        } finally {
+            setActionLoading(null);
+        }
+    }, [currentUserId, loadContacts]);
+
+    const unblockUser = useCallback(async (targetUserId) => {
+        if (!currentUserId || !targetUserId) return;
+        setActionLoading(targetUserId);
+
+        // Optimistic update
+        setBlockedUsers(prev => prev.filter(id => id !== targetUserId));
+
         try {
             const { error } = await supabase
                 .from('contacts')
                 .delete()
-                .or(`and(user_id.eq.${currentUserId},contact_user_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},contact_user_id.eq.${currentUserId})`);
+                .match({
+                    user_id: currentUserId,
+                    contact_user_id: targetUserId,
+                    status: 'blocked'
+                });
+
             if (error) throw error;
             await loadContacts();
         } catch (e) {
-            console.error("[FriendContext] unfriend failed:", e);
+            console.error("[FriendContext] unblockUser failed:", e);
+            await loadContacts();
+            throw e;
         } finally {
             setActionLoading(null);
         }
@@ -230,6 +434,7 @@ export function FriendProvider({ children }) {
         friends,
         incomingRequests,
         outgoingRequests,
+        blockedUsers,
         loading,
         actionLoading,
         sendRequest,
@@ -237,6 +442,8 @@ export function FriendProvider({ children }) {
         acceptRequest,
         rejectRequest,
         unfriend,
+        blockUser,
+        unblockUser,
         sendFriendRequest: sendRequest,
         cancelFriendRequest: cancelRequest,
         acceptFriendRequest: acceptRequest,
@@ -244,7 +451,23 @@ export function FriendProvider({ children }) {
         removeFriend: unfriend,
         getFriendStatus,
         refreshContacts: loadContacts
-    }), [friends, incomingRequests, outgoingRequests, loading, actionLoading, sendRequest, cancelRequest, acceptRequest, rejectRequest, unfriend, getFriendStatus, loadContacts]);
+    }), [
+        friends,
+        incomingRequests,
+        outgoingRequests,
+        blockedUsers,
+        loading,
+        actionLoading,
+        sendRequest,
+        cancelRequest,
+        acceptRequest,
+        rejectRequest,
+        unfriend,
+        blockUser,
+        unblockUser,
+        getFriendStatus,
+        loadContacts
+    ]);
 
     return (
         <FriendContext.Provider value={value}>

@@ -16,7 +16,20 @@ import { exitGroup, removeGroupParticipant, promoteToAdmin, dismissAdmin } from 
 
 export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     const { currentUser } = useAuth();
-    const { getFriendStatus, unfriend, sendRequest, cancelRequest, acceptRequest, incomingRequests, outgoingRequests, actionLoading } = useFriend();
+    const {
+        getFriendStatus,
+        unfriend,
+        sendRequest,
+        cancelRequest,
+        acceptRequest,
+        rejectRequest,
+        incomingRequests,
+        outgoingRequests,
+        blockedUsers,
+        blockUser,
+        unblockUser,
+        actionLoading
+    } = useFriend();
     const [mediaItems, setMediaItems] = useState({ media: [], links: [], docs: [] });
     const [showMediaTabs, setShowMediaTabs] = useState(false);
     const [mediaTab, setMediaTab] = useState('media');
@@ -54,9 +67,10 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
             }
         }
         fetchFullProfile();
-    }, [user?.uid, user?.isGroup]);
+    }, [user?.uid, user?.id, user?.isGroup]);
 
-    const isMuted = chat?.mutedBy?.[currentUser?.uid] || false;
+    const myUid = currentUser?.uid || currentUser?.id;
+    const [isMuted, setIsMuted] = useState(chat?.isMuted || false);
 
     const [allMessages, setAllMessages] = useState([]);
     const [summary, setSummary] = useState('');
@@ -125,18 +139,24 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     };
 
     const handleToggleMute = async () => {
+        if (!chat?.id) return;
         try {
-            await toggleMuteChat(chat.id, currentUser.uid, isMuted);
+            const next = !isMuted;
+            setIsMuted(next);
+            await toggleMuteChat(chat.id, myUid, isMuted);
         } catch (err) {
             console.error("Mute toggle failed:", err);
+            setIsMuted(isMuted);
         }
     };
 
     const handleClearChat = async () => {
-        if (window.confirm("Are you sure you want to clear all messages in this chat for you?")) {
+        if (!chat?.id) return;
+        if (window.confirm("Are you sure you want to clear all messages in this chat?")) {
             try {
-                await clearChat(chat.id, currentUser.uid);
-                onClose();
+                await clearChat(chat.id);
+                setAllMessages([]);
+                setMediaItems({ media: [], links: [], docs: [] });
             } catch (err) {
                 console.error("Error clearing chat:", err);
             }
@@ -144,18 +164,18 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     };
 
     const targetUserId = user?.uid || user?.id;
-    const isBlocked = currentUser?.blockedUsers?.includes(targetUserId);
+    const isBlocked = blockedUsers?.includes(targetUserId);
     const friendStatus = targetUserId ? getFriendStatus(targetUserId) : 'none';
 
     const handleBlockToggle = async () => {
-        if (!targetUserId || !currentUser?.uid) return;
+        if (!targetUserId || !myUid) return;
         const action = isBlocked ? "unblock" : "block";
         if (window.confirm(`Are you sure you want to ${action} this user?`)) {
             try {
                 if (isBlocked) {
-                    await unblockUser(currentUser.uid, targetUserId);
+                    await unblockUser(targetUserId);
                 } else {
-                    await blockUser(currentUser.uid, targetUserId);
+                    await blockUser(targetUserId);
                 }
             } catch (err) {
                 console.error(`Failed to ${action} user:`, err);
@@ -174,12 +194,9 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
             } else if (friendStatus === 'sent') {
                 await cancelRequest(targetUserId);
             } else if (friendStatus === 'received') {
-                const inReq = incomingRequests.find(r => r.fromId === targetUserId || r.id === targetUserId);
-                if (inReq) {
-                    await acceptRequest(inReq);
-                } else {
-                    await acceptRequest(targetUserId);
-                }
+                await acceptRequest(targetUserId);
+            } else if (friendStatus === 'blocked') {
+                await unblockUser(targetUserId);
             } else {
                 await sendRequest(targetUserId);
             }
@@ -192,6 +209,7 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
         friend: { icon: FaUserMinus, label: 'Unfriend', color: 'text-orange-500', bg: 'bg-orange-500/10', hoverBg: 'hover:bg-orange-500/20' },
         sent: { icon: FaUserClock, label: 'Cancel Request', color: 'text-yellow-500', bg: 'bg-yellow-500/10', hoverBg: 'hover:bg-yellow-500/20' },
         received: { icon: FaUserCheck, label: 'Accept Request', color: 'text-green-500', bg: 'bg-green-500/10', hoverBg: 'hover:bg-green-500/20' },
+        blocked: { icon: FaBan, label: 'Unblock User', color: 'text-red-500', bg: 'bg-red-500/10', hoverBg: 'hover:bg-red-500/20' },
         none: { icon: FaUserPlus, label: 'Add Friend', color: 'text-blue-500', bg: 'bg-blue-500/10', hoverBg: 'hover:bg-blue-500/20' }
     };
     const friendBtn = friendButtonConfig[friendStatus] || friendButtonConfig.none;
@@ -203,7 +221,8 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
         if (window.confirm("Are you sure you want to exit this group?")) {
             try {
                 await exitGroup(chat.id, currentUser.uid);
-                onClose(); // Close panel since we left
+                onClose();
+                window.location.href = '/'; // Close panel since we left
             } catch (err) {
                 console.error("Failed to exit group:", err);
                 alert("Failed to exit group.");
@@ -241,6 +260,7 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
             try {
                 await supabase.from('conversations').delete().eq('id', chat.id);
                 onClose();
+                window.location.href = '/';
             } catch (err) {
                 console.error("Error deleting chat:", err);
                 alert("Failed to delete chat.");
@@ -384,30 +404,62 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
                                 {/* Actions */}
                                 <div className="bg-surface-elevated/50 rounded-2xl overflow-hidden shadow-sm border border-border/30">
                                     {/* Friend Action Button */}
-                                    {user?.uid && user.uid !== currentUser?.uid && !user.isGroup && (
-                                        <button
-                                            className={cn(
-                                                "w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 transition-colors border-b border-border/30 group",
-                                                friendBtn.color, friendBtn.hoverBg
-                                            )}
-                                            onClick={handleFriendAction}
-                                            disabled={!!actionLoading}
-                                        >
-                                            <div className={cn(
-                                                "w-8 h-8 rounded-full flex items-center justify-center transition-colors",
-                                                friendBtn.bg, `group-hover:${friendBtn.bg}`
-                                            )}>
-                                                {actionLoading ? (
-                                                    <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-                                                ) : (
-                                                    <friendBtn.icon />
-                                                )}
+                                    {targetUserId && targetUserId !== myUid && !user.isGroup && (
+                                        friendStatus === 'received' ? (
+                                            <div className="flex items-center border-b border-border/30">
+                                                <button
+                                                    className="flex-1 flex items-center justify-center gap-2 p-3.5 sm:p-4 text-green-500 hover:bg-green-500/10 transition-colors font-medium text-[14px] sm:text-[15px] border-r border-border/30 cursor-pointer disabled:opacity-50"
+                                                    onClick={handleFriendAction}
+                                                    disabled={!!actionLoading}
+                                                >
+                                                    <FaUserCheck className="w-4 h-4" />
+                                                    <span>{actionLoading ? 'Accepting...' : 'Accept Request'}</span>
+                                                </button>
+                                                <button
+                                                    className="flex-1 flex items-center justify-center gap-2 p-3.5 sm:p-4 text-red-500 hover:bg-red-500/10 transition-colors font-medium text-[14px] sm:text-[15px] cursor-pointer disabled:opacity-50"
+                                                    onClick={async () => {
+                                                        try {
+                                                            await rejectRequest(targetUserId);
+                                                        } catch (err) {
+                                                            alert(err.message || 'Reject failed.');
+                                                        }
+                                                    }}
+                                                    disabled={!!actionLoading}
+                                                >
+                                                    <FaTimes className="w-4 h-4" />
+                                                    <span>Reject</span>
+                                                </button>
                                             </div>
-                                            <span className="text-[14px] sm:text-[15px] font-medium">{friendBtn.label}</span>
-                                        </button>
+                                        ) : (
+                                            <button
+                                                className={cn(
+                                                    "w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 transition-colors border-b border-border/30 group cursor-pointer disabled:opacity-50",
+                                                    friendBtn.color, friendBtn.hoverBg
+                                                )}
+                                                onClick={handleFriendAction}
+                                                disabled={!!actionLoading}
+                                            >
+                                                <div className={cn(
+                                                    "w-8 h-8 rounded-full flex items-center justify-center transition-colors",
+                                                    friendBtn.bg, `group-hover:${friendBtn.bg}`
+                                                )}>
+                                                    {actionLoading ? (
+                                                        <div className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+                                                    ) : (
+                                                        <friendBtn.icon />
+                                                    )}
+                                                </div>
+                                                <span className="text-[14px] sm:text-[15px] font-medium">
+                                                    {actionLoading ? 'Updating...' : friendBtn.label}
+                                                </span>
+                                            </button>
+                                        )
                                     )}
 
-                                    <button className="w-full flex items-center justify-between p-3 sm:p-4 hover:bg-surface-elevated transition-colors border-b border-border/30">
+                                    <button
+                                        className="w-full flex items-center justify-between p-3 sm:p-4 hover:bg-surface-elevated transition-colors border-b border-border/30 cursor-pointer"
+                                        onClick={() => setShowMediaTabs(true)}
+                                    >
                                         <div className="flex items-center gap-3 sm:gap-4">
                                             <div className="w-8 h-8 rounded-full bg-surface flex items-center justify-center text-text-2">
                                                 <FaStar />
@@ -417,7 +469,7 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
                                         <FaChevronRight className="text-text-2 text-xs" />
                                     </button>
 
-                                    <button className="w-full flex items-center justify-between p-3 sm:p-4 hover:bg-surface-elevated transition-colors border-b border-border/30" onClick={handleToggleMute}>
+                                    <button className="w-full flex items-center justify-between p-3 sm:p-4 hover:bg-surface-elevated transition-colors border-b border-border/30 cursor-pointer" onClick={handleToggleMute}>
                                         <div className="flex items-center gap-3 sm:gap-4">
                                             <div className="w-8 h-8 rounded-full bg-surface flex items-center justify-center text-text-2">
                                                 {isMuted ? <FaBellSlash /> : <FaBell />}
@@ -429,14 +481,14 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
                                         </div>
                                     </button>
 
-                                    <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 border-b border-border/30 group" onClick={handleClearChat}>
+                                    <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 border-b border-border/30 group cursor-pointer" onClick={handleClearChat}>
                                         <div className="w-8 h-8 rounded-full bg-red-500/10 flex items-center justify-center group-hover:bg-red-500 group-hover:text-white transition-colors">
                                             <FaTrash />
                                         </div>
                                         <span className="text-[14px] sm:text-[15px] font-medium">Clear Chat</span>
                                     </button>
 
-                                    <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 border-b border-border/30 group" onClick={handleBlockToggle}>
+                                    <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 border-b border-border/30 group cursor-pointer" onClick={handleBlockToggle}>
                                         <div className="w-8 h-8 rounded-full bg-red-500/10 flex items-center justify-center group-hover:bg-red-500 group-hover:text-white transition-colors">
                                             <FaBan />
                                         </div>
@@ -444,7 +496,7 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
                                     </button>
 
                                     {!isGroup && (
-                                        <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 group" onClick={handleDeleteChat}>
+                                        <button className="w-full flex items-center gap-3 sm:gap-4 p-3 sm:p-4 hover:bg-red-500/10 transition-colors text-red-500 group cursor-pointer" onClick={handleDeleteChat}>
                                             <div className="w-8 h-8 rounded-full bg-red-500/10 flex items-center justify-center group-hover:bg-red-500 group-hover:text-white transition-colors">
                                                 <FaTrash />
                                             </div>
