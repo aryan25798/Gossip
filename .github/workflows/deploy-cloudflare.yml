@@ -28,16 +28,16 @@ jobs:
       - name: Compile Production Build
         run: npm run build
         env:
-          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
-          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
-          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID }}
-          VITE_MAPMYINDIA_API_KEY: ${{ secrets.VITE_MAPMYINDIA_API_KEY }}
-          VITE_MAPPLS_API_KEY: ${{ secrets.VITE_MAPPLS_API_KEY }}
-          VITE_METERED_DOMAIN: ${{ secrets.VITE_METERED_DOMAIN }}
-          VITE_METERED_API_KEY: ${{ secrets.VITE_METERED_API_KEY }}
-          VITE_TURN_SERVER_URL: ${{ secrets.VITE_TURN_SERVER_URL }}
-          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME }}
-          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL || 'https://fijjtocoiaumfxzdjxbi.supabase.co' }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZpamp0b2NvaWF1bWZ4emRqeGJpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ3MjczMDgsImV4cCI6MjExMDMwMzMwOH0.YIbmTT6kSvmWn5XKx5lXRLWvN2IBpoLexii9pq7QpHE' }}
+          VITE_GOOGLE_CLIENT_ID: ${{ secrets.VITE_GOOGLE_CLIENT_ID || '516132173835-biqd9p55lt0a3ia3qkr95sk245d5m5gt.apps.googleusercontent.com' }}
+          VITE_MAPMYINDIA_API_KEY: ${{ secrets.VITE_MAPMYINDIA_API_KEY || 'dtbcmezcuovukpygcuegiuimtvizaohaamid' }}
+          VITE_MAPPLS_API_KEY: ${{ secrets.VITE_MAPPLS_API_KEY || 'dtbcmezcuovukpygcuegiuimtvizaohaamid' }}
+          VITE_METERED_DOMAIN: ${{ secrets.VITE_METERED_DOMAIN || 'novachatcalls.metered.live' }}
+          VITE_METERED_API_KEY: ${{ secrets.VITE_METERED_API_KEY || '3dc65bfd3466e60a276da79e02e0b1424ed2' }}
+          VITE_TURN_SERVER_URL: ${{ secrets.VITE_TURN_SERVER_URL || 'turn:global.relay.metered.ca:80,turn:global.relay.metered.ca:443,turns:global.relay.metered.ca:443?transport=tcp' }}
+          VITE_TURN_USERNAME: ${{ secrets.VITE_TURN_USERNAME || 'fcc66fb93997ba62829266f4' }}
+          VITE_TURN_CREDENTIAL: ${{ secrets.VITE_TURN_CREDENTIAL || 'tXdjE5PAILtHrUTx' }}
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
