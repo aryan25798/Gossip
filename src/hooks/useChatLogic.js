@@ -84,7 +84,18 @@ export function useChatLogic(chat, currentUser) {
         setPendingQueue(prev => [...prev, optimisticMsg]);
 
         try {
-            await sendMessage(chat.id, currentUser, text, replyContext, messageId, metadata);
+            const sentMsg = await sendMessage(chat.id, currentUser, text, replyContext, messageId, metadata);
+            // Clear from pendingQueue on success so clock icon disappears immediately
+            setPendingQueue(prev => prev.filter(m => m.id !== messageId && m.clientMessageId !== messageId));
+            if (sentMsg) {
+                setMessages(prev => {
+                    const exists = prev.some(m => m.id === sentMsg.id || (m.clientMessageId && m.clientMessageId === sentMsg.clientMessageId));
+                    if (exists) {
+                        return prev.map(m => (m.id === sentMsg.id || m.clientMessageId === sentMsg.clientMessageId) ? sentMsg : m);
+                    }
+                    return [...prev, sentMsg];
+                });
+            }
         } catch (err) {
             console.error("Send failed:", err);
             setPendingQueue(prev => prev.filter(m => m.id !== messageId));

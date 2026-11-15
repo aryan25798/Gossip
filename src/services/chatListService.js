@@ -46,10 +46,25 @@ export const subscribeToUserChats = (userId, callback, limitCount = 30) => {
                 loadChats();
             }
         )
+        .on(
+            'broadcast',
+            { event: 'chat_updated' },
+            () => {
+                loadChats();
+            }
+        )
         .subscribe();
+
+    // Heartbeat fallback polling every 4 seconds to guarantee sidebar stays fresh
+    const intervalId = setInterval(() => {
+        if (isSubscribed) {
+            loadChats();
+        }
+    }, 4000);
 
     return () => {
         isSubscribed = false;
+        clearInterval(intervalId);
         supabase.removeChannel(channel);
     };
 };

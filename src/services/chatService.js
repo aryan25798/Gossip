@@ -8,25 +8,31 @@ export const chatService = {
         if (!chatId) return () => {};
 
         let messagesList = [];
+        let isCancelled = false;
 
         // Fetch initial history (most recent 50 messages)
-        supabase
-            .from('messages')
-            .select('*')
-            .eq('conversation_id', chatId)
-            .order('created_at', { ascending: true })
-            .limit(50)
-            .then(({ data, error }) => {
-                if (data && !error) {
-                    messagesList = data
-                        .map(r => formatMessage(r, currentUserId))
-                        .filter(m => !m.isDeletedForMe);
-                    callback(messagesList);
+        const fetchHistory = () => {
+            supabase
+                .from('messages')
+                .select('*')
+                .eq('conversation_id', chatId)
+                .order('created_at', { ascending: true })
+                .limit(50)
+                .then(({ data, error }) => {
+                    if (isCancelled) return;
+                    if (data && !error) {
+                        messagesList = data
+                            .map(r => formatMessage(r, currentUserId))
+                            .filter(m => !m.isDeletedForMe);
+                        callback(messagesList);
 
-                    // Mark unread messages as read
-                    chatService.markMessagesAsRead(chatId, currentUserId);
-                }
-            });
+                        // Mark unread messages as read
+                        chatService.markMessagesAsRead(chatId, currentUserId);
+                    }
+                });
+        };
+
+        fetchHistory();
 
         // Supabase Realtime channel for instant messages and updates
         const channel = supabase
@@ -41,7 +47,7 @@ export const chatService = {
                 },
                 (payload) => {
                     const newMsg = formatMessage(payload.new, currentUserId);
-                    if (newMsg.isDeletedForMe) return;
+                    if (!newMsg || newMsg.isDeletedForMe) return;
 
                     // If received from someone else while chat is open, mark as read
                     if (newMsg.senderId !== currentUserId) {
@@ -64,6 +70,7 @@ export const chatService = {
                 },
                 (payload) => {
                     const updated = formatMessage(payload.new, currentUserId);
+                    if (!updated) return;
                     if (updated.isDeletedForMe) {
                         messagesList = messagesList.filter(m => m.id !== updated.id);
                     } else {
@@ -85,9 +92,73 @@ export const chatService = {
                     callback(messagesList);
                 }
             )
+            .on(
+                'broadcast',
+                { event: 'new_message' },
+                ({ payload }) => {
+                    const newMsg = formatMessage(payload, currentUserId);
+                    if (!newMsg || newMsg.isDeletedForMe) return;
+
+                    if (newMsg.senderId !== currentUserId) {
+                        chatService.markMessagesAsRead(chatId, currentUserId);
+                    }
+
+                    if (!messagesList.some(m => m.id === newMsg.id || (m.clientMessageId && m.clientMessageId === newMsg.clientMessageId))) {
+                        messagesList = [...messagesList, newMsg];
+                        callback(messagesList);
+                    }
+                }
+            )
+            .on(
+                'broadcast',
+                { event: 'message_deleted' },
+                ({ payload }) => {
+                    if (!payload?.id) return;
+                    messagesList = messagesList.filter(m => m.id !== payload.id && m.clientMessageId !== payload.id);
+                    callback(messagesList);
+                }
+            )
+            .on(
+                'broadcast',
+                { event: 'reaction_updated' },
+                ({ payload }) => {
+                    if (!payload?.messageId) return;
+                    messagesList = messagesList.map(m => {
+                        if (m.id === payload.messageId || m.clientMessageId === payload.messageId) {
+                            return { ...m, reactions: payload.reactions };
+                        }
+                        return m;
+                    });
+                    callback(messagesList);
+                }
+            )
             .subscribe();
 
+        // Active 3.5s heartbeat sync to guarantee real-time updates even across sleep/disconnect
+        const syncInterval = setInterval(() => {
+            if (isCancelled) return;
+            supabase
+                .from('messages')
+                .select('*')
+                .eq('conversation_id', chatId)
+                .order('created_at', { ascending: true })
+                .limit(50)
+                .then(({ data, error }) => {
+                    if (isCancelled || error || !data) return;
+                    const fetched = data
+                        .map(r => formatMessage(r, currentUserId))
+                        .filter(m => !m.isDeletedForMe);
+
+                    if (fetched.length !== messagesList.length || fetched.some((msg, idx) => msg.id !== messagesList[idx]?.id || msg.status !== messagesList[idx]?.status)) {
+                        messagesList = fetched;
+                        callback(messagesList);
+                    }
+                });
+        }, 3500);
+
         return () => {
+            isCancelled = true;
+            clearInterval(syncInterval);
             supabase.removeChannel(channel);
         };
     },
@@ -138,7 +209,21 @@ export const chatService = {
         // Increment unread count for other participants
         await chatService.incrementUnreadForOthers(chatId, senderId);
 
-        return formatMessage(data, senderId);
+        const formatted = formatMessage(data, senderId);
+
+        // Instant Realtime Broadcast to receiver's active chat channel
+        try {
+            const broadcastChan = supabase.channel(`chat_${chatId}`);
+            broadcastChan.send({
+                type: 'broadcast',
+                event: 'new_message',
+                payload: formatted
+            }).catch(() => {});
+        } catch (e) {
+            console.debug('[chatService] broadcast send error:', e);
+        }
+
+        return formatted;
     },
 
     // 3. Send media message (Supports chunked TUS upload & fallback)
@@ -202,7 +287,21 @@ export const chatService = {
 
         await chatService.incrementUnreadForOthers(chatId, senderId);
 
-        return formatMessage(data, senderId);
+        const formatted = formatMessage(data, senderId);
+
+        // Instant Realtime Broadcast to receiver's active chat channel
+        try {
+            const broadcastChan = supabase.channel(`chat_${chatId}`);
+            broadcastChan.send({
+                type: 'broadcast',
+                event: 'new_message',
+                payload: formatted
+            }).catch(() => {});
+        } catch (e) {
+            console.debug('[chatService] broadcast media error:', e);
+        }
+
+        return formatted;
     },
 
     // 4. Edit message
@@ -367,11 +466,16 @@ export const chatService = {
     setTypingStatus: (chatId, userId, isTyping) => {
         if (!chatId) return;
         const channel = supabase.channel(`typing_${chatId}`);
-        channel.send({
+        const payload = {
             type: 'broadcast',
             event: 'typing',
             payload: { userId, isTyping }
-        });
+        };
+        if (typeof channel.httpSend === 'function') {
+            channel.httpSend(payload).catch(() => {});
+        } else {
+            channel.send(payload).catch(() => {});
+        }
     },
 
     subscribeToTyping: (chatId, callback) => {
@@ -416,12 +520,28 @@ export const chatService = {
                 .eq('conversation_id', conv.id);
 
             const otherUser = members?.find(m => m.user_id !== userId)?.users;
+            const participantInfo = {};
+            if (members) {
+                members.forEach(m => {
+                    if (m.users) {
+                        participantInfo[m.user_id] = {
+                            displayName: m.users.display_name,
+                            photoURL: m.users.avatar_url,
+                            aboutStatus: m.users.about_status
+                        };
+                    }
+                });
+            }
+
+            const resolvedName = conv.type === 'direct' ? (otherUser?.display_name || 'Direct Chat') : (conv.title || 'Group');
+            const resolvedPhoto = conv.type === 'direct' ? otherUser?.avatar_url : conv.avatar_url;
 
             chats.push({
                 id: conv.id,
-                name: conv.type === 'direct' ? (otherUser?.display_name || 'Direct Chat') : conv.title,
-                chatName: conv.type === 'direct' ? (otherUser?.display_name || 'Direct Chat') : conv.title,
-                photoURL: conv.type === 'direct' ? otherUser?.avatar_url : conv.avatar_url,
+                name: resolvedName,
+                chatName: resolvedName,
+                displayName: resolvedName,
+                photoURL: resolvedPhoto,
                 lastMessage: conv.last_message_text,
                 lastMessageTimestamp: conv.last_message_at,
                 unreadCount: p.unread_count || 0,
@@ -429,7 +549,8 @@ export const chatService = {
                 isMuted: p.is_muted || false,
                 type: conv.type,
                 participants: members?.map(m => m.user_id) || [],
-                participantDetails: members?.map(m => m.users) || []
+                participantDetails: members?.map(m => m.users) || [],
+                participantInfo
             });
         }
 
@@ -665,42 +786,47 @@ export const chatService = {
 
 export function formatMessage(row, currentUserId = null) {
     if (!row) return null;
+    if (row.isFormatted) return row;
 
-    const isDeletedForMe = currentUserId && Array.isArray(row.deleted_for) && row.deleted_for.includes(currentUserId);
-    const mime = row.media_metadata?.mimeType || '';
-    const isImage = row.message_type === 'image' || mime.startsWith('image/');
-    const isVideo = row.message_type === 'video' || mime.startsWith('video/');
-    const isAudio = row.message_type === 'audio' || mime.startsWith('audio/');
+    const isDeletedForMe = currentUserId && Array.isArray(row.deleted_for || row.deletedFor) && (row.deleted_for || row.deletedFor).includes(currentUserId);
+    const mime = row.media_metadata?.mimeType || row.fileType || '';
+    const msgType = row.message_type || row.type || 'text';
+    const isImage = msgType === 'image' || mime.startsWith('image/');
+    const isVideo = msgType === 'video' || mime.startsWith('video/');
+    const isAudio = msgType === 'audio' || mime.startsWith('audio/');
+    const media = row.media_url || row.mediaUrl || row.fileUrl;
+    const textContent = row.content !== undefined ? row.content : (row.text !== undefined ? row.text : '');
 
     return {
         id: row.id,
-        clientMessageId: row.client_message_id,
-        conversationId: row.conversation_id,
-        senderId: row.sender_id,
-        senderName: row.sender_name || 'User',
-        text: row.content,
-        content: row.content,
-        type: row.message_type,
-        mediaUrl: row.media_url,
-        fileUrl: row.media_url,
-        imageUrl: isImage ? row.media_url : null,
-        videoUrl: isVideo ? row.media_url : null,
-        audioUrl: isAudio ? row.media_url : null,
-        fileName: row.media_metadata?.fileName || (row.media_url ? row.media_url.split('/').pop() : 'Attachment'),
-        fileSize: row.media_metadata?.fileSize || null,
-        fileType: row.media_metadata?.mimeType || null,
-        width: row.media_metadata?.width || null,
-        height: row.media_metadata?.height || null,
-        mediaMetadata: row.media_metadata,
+        clientMessageId: row.client_message_id || row.clientMessageId,
+        conversationId: row.conversation_id || row.conversationId,
+        senderId: row.sender_id || row.senderId,
+        senderName: row.sender_name || row.senderName || 'User',
+        text: textContent,
+        content: textContent,
+        type: msgType,
+        mediaUrl: media,
+        fileUrl: media,
+        imageUrl: isImage ? media : null,
+        videoUrl: isVideo ? media : null,
+        audioUrl: isAudio ? media : null,
+        fileName: row.media_metadata?.fileName || row.fileName || (media ? media.split('/').pop() : 'Attachment'),
+        fileSize: row.media_metadata?.fileSize || row.fileSize || null,
+        fileType: row.media_metadata?.mimeType || row.fileType || null,
+        width: row.media_metadata?.width || row.width || null,
+        height: row.media_metadata?.height || row.height || null,
+        mediaMetadata: row.media_metadata || row.mediaMetadata,
         status: row.status || 'sent',
-        replyTo: row.reply_to || null,
+        replyTo: row.reply_to || row.replyTo || null,
         reactions: row.reactions || {},
-        isSoftDeleted: !!row.is_deleted,
-        deletedFor: row.deleted_for || [],
+        isSoftDeleted: !!(row.is_deleted || row.isSoftDeleted),
+        deletedFor: row.deleted_for || row.deletedFor || [],
         isDeletedForMe,
-        isEdited: !!row.is_edited,
-        editedAt: row.edited_at,
-        timestamp: row.created_at
+        isEdited: !!(row.is_edited || row.isEdited),
+        editedAt: row.edited_at || row.editedAt,
+        timestamp: row.created_at || row.timestamp || new Date().toISOString(),
+        isFormatted: true
     };
 }
 

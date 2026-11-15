@@ -9,23 +9,19 @@ const ChatListItem = memo(({ chat, currentUserId }) => {
     const { id } = useParams();
     const repairAttemptedRef = React.useRef(false);
 
+    const otherUserId = chat.participants?.find(uid => uid !== currentUserId);
+    const userInfo = chat.participantInfo?.[otherUserId] || chat.participantDetails?.find(u => (u.id || u.uid) === otherUserId);
+
     // Determine metadata for Group or Private chat
     const displayInfo = {
-        name: chat.groupName || (chat.chatName || "Unknown"),
-        photo: (chat.photoURL || chat.groupImage),
+        name: chat.type === 'group'
+            ? (chat.groupName || chat.title || chat.name || "Group")
+            : (userInfo?.displayName || userInfo?.display_name || chat.name || chat.chatName || chat.displayName || "User"),
+        photo: chat.type === 'group'
+            ? (chat.photoURL || chat.groupImage)
+            : (userInfo?.photoURL || userInfo?.avatar_url || chat.photoURL || chat.avatar_url),
         id: chat.id
     };
-
-    if (chat.type !== 'group') {
-        const otherUserId = chat.participants?.find(uid => uid !== currentUserId);
-        const userInfo = chat.participantInfo?.[otherUserId];
-
-        displayInfo.name = userInfo?.displayName || "User";
-        displayInfo.photo = userInfo?.photoURL;
-        displayInfo.id = otherUserId || chat.id;
-
-
-    }
 
     const isActive = id === chat.id; // Match against chat ID for the list
     const lastMessageDate = React.useMemo(() => {
