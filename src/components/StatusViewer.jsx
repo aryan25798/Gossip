@@ -121,10 +121,11 @@ export default function StatusViewer({ initialUser, allStatuses, onClose }) {
                         <div className="flex flex-col drop-shadow-md">
                             <h4 className="text-white text-[15px] font-semibold leading-tight tracking-wide">{currentUserData.userName}</h4>
                             <span className="text-white/80 text-[11px] font-medium opacity-80">
-                                {new Date(currentItem.timestamp instanceof Date
-                                    ? currentItem.timestamp
-                                    : currentItem.timestamp?.toDate ? currentItem.timestamp.toDate() : Date.now()
-                                ).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                                {(() => {
+                                    const ts = currentItem.timestamp;
+                                    const d = ts instanceof Date ? ts : (ts?.toDate ? ts.toDate() : (ts ? new Date(ts) : new Date()));
+                                    return isNaN(d.getTime()) ? 'Just now' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                                })()}
                             </span>
                         </div>
                     </div>

@@ -7,6 +7,12 @@ import { motion } from "framer-motion";
 import { subscribeToMyStatus, subscribeToRecentUpdates } from "../services/statusService";
 import { cn } from "../lib/utils";
 
+const formatStatusTime = (t) => {
+    if (!t) return "Just now";
+    const d = t?.toDate ? t.toDate() : new Date(t);
+    return isNaN(d.getTime()) ? "Just now" : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+};
+
 export default function StatusDrawer({ onClose }) {
     const { currentUser } = useAuth();
     const [myStatus, setMyStatus] = useState(null);
@@ -113,10 +119,7 @@ export default function StatusDrawer({ onClose }) {
                                         <div className="flex flex-col justify-center">
                                             <span className="text-text-1 font-medium text-[16px]">{status.userName}</span>
                                             <span className="text-text-2 text-[13px]">
-                                                {status.items[status.items.length - 1]?.timestamp?.toDate
-                                                    ? new Date(status.items[status.items.length - 1].timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                                                    : "Just now"
-                                                }
+                                                {formatStatusTime(status.items[status.items.length - 1]?.timestamp)}
                                             </span>
                                         </div>
                                     </div>
@@ -146,10 +149,7 @@ export default function StatusDrawer({ onClose }) {
                                         <div className="flex flex-col justify-center">
                                             <span className="text-text-1 font-medium text-[16px]">{status.userName}</span>
                                             <span className="text-text-2 text-[13px]">
-                                                {status.items[status.items.length - 1]?.timestamp?.toDate
-                                                    ? new Date(status.items[status.items.length - 1].timestamp.toDate()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                                                    : "Just now"
-                                                }
+                                                {formatStatusTime(status.items[status.items.length - 1]?.timestamp)}
                                             </span>
                                         </div>
                                     </div>

@@ -9,32 +9,84 @@ export const chatService = {
 
         let messagesList = [];
         let isCancelled = false;
+        let isConnected = false;
+        let disconnectPollInterval = null;
 
-        // Fetch initial history (most recent 50 messages)
-        const fetchHistory = () => {
-            supabase
-                .from('messages')
-                .select('*')
-                .eq('conversation_id', chatId)
-                .order('created_at', { ascending: true })
-                .limit(50)
-                .then(({ data, error }) => {
-                    if (isCancelled) return;
-                    if (data && !error) {
-                        messagesList = data
-                            .map(r => formatMessage(r, currentUserId))
-                            .filter(m => !m.isDeletedForMe);
-                        callback(messagesList);
+        // Efficient delta/full sync
+        const syncMessages = async () => {
+            if (isCancelled) return;
+            try {
+                const { data, error } = await supabase
+                    .from('messages')
+                    .select('*')
+                    .eq('conversation_id', chatId)
+                    .order('created_at', { ascending: true })
+                    .limit(50);
 
-                        // Mark unread messages as read
-                        chatService.markMessagesAsRead(chatId, currentUserId);
-                    }
-                });
+                if (isCancelled || error || !data) return;
+
+                const fetched = data
+                    .map(r => formatMessage(r, currentUserId))
+                    .filter(m => !m.isDeletedForMe);
+
+                const hasChanges = fetched.length !== messagesList.length ||
+                    fetched.some((msg, idx) => msg.id !== messagesList[idx]?.id || msg.status !== messagesList[idx]?.status);
+
+                if (hasChanges) {
+                    messagesList = fetched;
+                    callback(messagesList);
+                }
+
+                // Auto-mark unread messages
+                if (fetched.some(m => m.senderId !== currentUserId && m.status !== 'read')) {
+                    chatService.markMessagesAsRead(chatId, currentUserId);
+                }
+            } catch (err) {
+                console.warn("[chatService] syncMessages failed:", err);
+            }
         };
 
-        fetchHistory();
+        const startDisconnectPolling = () => {
+            if (disconnectPollInterval || isCancelled) return;
+            // Poll every 5s ONLY when WebSocket is disconnected
+            disconnectPollInterval = setInterval(() => {
+                if (!isConnected && !isCancelled) {
+                    syncMessages();
+                }
+            }, 5000);
+        };
 
-        // Supabase Realtime channel for instant messages and updates
+        const stopDisconnectPolling = () => {
+            if (disconnectPollInterval) {
+                clearInterval(disconnectPollInterval);
+                disconnectPollInterval = null;
+            }
+        };
+
+        // Event-driven sync on tab focus and network reconnection
+        const handleVisibilityChange = () => {
+            if (typeof document !== 'undefined' && document.visibilityState === 'visible' && !isCancelled) {
+                syncMessages();
+            }
+        };
+
+        const handleOnline = () => {
+            if (!isCancelled) {
+                syncMessages();
+            }
+        };
+
+        if (typeof document !== 'undefined') {
+            document.addEventListener('visibilitychange', handleVisibilityChange);
+        }
+        if (typeof window !== 'undefined') {
+            window.addEventListener('online', handleOnline);
+        }
+
+        // Initial fetch
+        syncMessages();
+
+        // Supabase Realtime channel for instant sub-50ms message delivery
         const channel = supabase
             .channel(`chat_${chatId}`)
             .on(
@@ -132,33 +184,27 @@ export const chatService = {
                     callback(messagesList);
                 }
             )
-            .subscribe();
-
-        // Active 3.5s heartbeat sync to guarantee real-time updates even across sleep/disconnect
-        const syncInterval = setInterval(() => {
-            if (isCancelled) return;
-            supabase
-                .from('messages')
-                .select('*')
-                .eq('conversation_id', chatId)
-                .order('created_at', { ascending: true })
-                .limit(50)
-                .then(({ data, error }) => {
-                    if (isCancelled || error || !data) return;
-                    const fetched = data
-                        .map(r => formatMessage(r, currentUserId))
-                        .filter(m => !m.isDeletedForMe);
-
-                    if (fetched.length !== messagesList.length || fetched.some((msg, idx) => msg.id !== messagesList[idx]?.id || msg.status !== messagesList[idx]?.status)) {
-                        messagesList = fetched;
-                        callback(messagesList);
-                    }
-                });
-        }, 3500);
+            .subscribe((status) => {
+                if (status === 'SUBSCRIBED') {
+                    isConnected = true;
+                    stopDisconnectPolling();
+                    // Catch-up delta sync upon connection
+                    syncMessages();
+                } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                    isConnected = false;
+                    startDisconnectPolling();
+                }
+            });
 
         return () => {
             isCancelled = true;
-            clearInterval(syncInterval);
+            stopDisconnectPolling();
+            if (typeof document !== 'undefined') {
+                document.removeEventListener('visibilitychange', handleVisibilityChange);
+            }
+            if (typeof window !== 'undefined') {
+                window.removeEventListener('online', handleOnline);
+            }
             supabase.removeChannel(channel);
         };
     },
@@ -211,16 +257,18 @@ export const chatService = {
 
         const formatted = formatMessage(data, senderId);
 
-        // Instant Realtime Broadcast to receiver's active chat channel
+        // Instant Realtime Broadcast if channel is joined
         try {
             const broadcastChan = supabase.channel(`chat_${chatId}`);
-            broadcastChan.send({
-                type: 'broadcast',
-                event: 'new_message',
-                payload: formatted
-            }).catch(() => {});
+            if (broadcastChan.state === 'joined') {
+                broadcastChan.send({
+                    type: 'broadcast',
+                    event: 'new_message',
+                    payload: formatted
+                }).catch(() => {});
+            }
         } catch (e) {
-            console.debug('[chatService] broadcast send error:', e);
+            // Realtime postgres_changes delivers the message reliably
         }
 
         return formatted;
@@ -564,6 +612,43 @@ export const chatService = {
 
     // 12. Create Direct Chat (idempotent lookup)
     createDirectChat: async (currentUserId, targetUserId) => {
+        if (!currentUserId || !targetUserId) return null;
+
+        // Handle self-chat case (e.g. "Message yourself" / Notes)
+        if (currentUserId === targetUserId) {
+            const { data: selfChats } = await supabase
+                .from('conversations')
+                .select('id, type, created_by')
+                .eq('created_by', currentUserId)
+                .eq('type', 'direct');
+
+            if (selfChats && selfChats.length > 0) {
+                for (const sc of selfChats) {
+                    const { data: parts } = await supabase
+                        .from('conversation_participants')
+                        .select('user_id')
+                        .eq('conversation_id', sc.id);
+                    if (parts && parts.length === 1 && parts[0].user_id === currentUserId) {
+                        return sc.id;
+                    }
+                }
+            }
+
+            const { data: conv, error: convErr } = await supabase
+                .from('conversations')
+                .insert({ type: 'direct', created_by: currentUserId })
+                .select()
+                .maybeSingle();
+
+            if (convErr) throw convErr;
+
+            await supabase.from('conversation_participants').insert([
+                { conversation_id: conv.id, user_id: currentUserId, role: 'owner' }
+            ]);
+            return conv.id;
+        }
+
+        // Standard direct chat between distinct users
         const { data: userChats } = await supabase
             .from('conversation_participants')
             .select('conversation_id, conversations!inner(type)')
@@ -592,10 +677,11 @@ export const chatService = {
 
         if (convErr) throw convErr;
 
-        await supabase.from('conversation_participants').insert([
-            { conversation_id: conv.id, user_id: currentUserId, role: 'member' },
-            { conversation_id: conv.id, user_id: targetUserId, role: 'member' }
-        ]);
+        const allUserIds = Array.from(new Set([currentUserId, targetUserId].filter(Boolean)));
+        const { error: pErr } = await supabase.from('conversation_participants').insert(
+            allUserIds.map(uid => ({ conversation_id: conv.id, user_id: uid, role: 'member' }))
+        );
+        if (pErr) throw pErr;
 
         return conv.id;
     },

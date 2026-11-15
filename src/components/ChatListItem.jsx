@@ -28,6 +28,10 @@ const ChatListItem = memo(({ chat, currentUserId }) => {
         const t = chat.lastMessageTimestamp;
         if (!t) return null;
         if (t instanceof Date) return t;
+        if (typeof t === 'string') {
+            const d = new Date(t);
+            return isNaN(d.getTime()) ? null : d;
+        }
         if (typeof t === 'number') return new Date(t);
         if (typeof t.toDate === 'function') return t.toDate();
         if (t.seconds) return new Date(t.seconds * 1000);

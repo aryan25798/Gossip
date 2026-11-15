@@ -30,13 +30,23 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
         setFullUser(user); // Reset on prop change
 
         async function fetchFullProfile() {
-            if (user?.uid && !user.isGroup) {
-                // If email is missing, we definitely need to fetch. 
-                // Even if not, it's good to get the latest 'about' status.
+            const targetId = user?.uid || user?.id;
+            if (targetId && !user.isGroup) {
                 try {
-                    const userDoc = await getDoc(doc(db, "users", user.uid));
-                    if (userDoc.exists()) {
-                        setFullUser(prev => ({ ...prev, ...userDoc.data() }));
+                    const { data: userProfile } = await supabase
+                        .from('users')
+                        .select('*')
+                        .eq('id', targetId)
+                        .maybeSingle();
+
+                    if (userProfile) {
+                        setFullUser(prev => ({
+                            ...prev,
+                            ...userProfile,
+                            displayName: userProfile.display_name,
+                            photoURL: userProfile.avatar_url,
+                            about: userProfile.about_status
+                        }));
                     }
                 } catch (e) {
                     console.error("Failed to fetch full user profile", e);
@@ -133,18 +143,19 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
         }
     };
 
-    const isBlocked = currentUser?.blockedUsers?.includes(user?.uid);
-    const friendStatus = user?.uid ? getFriendStatus(user.uid) : 'none';
+    const targetUserId = user?.uid || user?.id;
+    const isBlocked = currentUser?.blockedUsers?.includes(targetUserId);
+    const friendStatus = targetUserId ? getFriendStatus(targetUserId) : 'none';
 
     const handleBlockToggle = async () => {
-        if (!user?.uid || !currentUser?.uid) return;
+        if (!targetUserId || !currentUser?.uid) return;
         const action = isBlocked ? "unblock" : "block";
         if (window.confirm(`Are you sure you want to ${action} this user?`)) {
             try {
                 if (isBlocked) {
-                    await unblockUser(currentUser.uid, user.uid);
+                    await unblockUser(currentUser.uid, targetUserId);
                 } else {
-                    await blockUser(currentUser.uid, user.uid);
+                    await blockUser(currentUser.uid, targetUserId);
                 }
             } catch (err) {
                 console.error(`Failed to ${action} user:`, err);
@@ -154,20 +165,23 @@ export default function ContactInfoPanel({ user, chat, onClose, isOpen }) {
     };
 
     const handleFriendAction = async () => {
-        if (!user?.uid || actionLoading) return;
+        if (!targetUserId || actionLoading) return;
         try {
             if (friendStatus === 'friend') {
                 if (window.confirm(`Remove ${fullUser.displayName || 'this user'} from your friends?`)) {
-                    await unfriend(user.uid);
+                    await unfriend(targetUserId);
                 }
             } else if (friendStatus === 'sent') {
-                const outReq = outgoingRequests.find(r => r.to === user.uid);
-                if (outReq) await cancelRequest(outReq.id);
+                await cancelRequest(targetUserId);
             } else if (friendStatus === 'received') {
-                const inReq = incomingRequests.find(r => r.from === user.uid);
-                if (inReq) await acceptRequest(inReq);
+                const inReq = incomingRequests.find(r => r.fromId === targetUserId || r.id === targetUserId);
+                if (inReq) {
+                    await acceptRequest(inReq);
+                } else {
+                    await acceptRequest(targetUserId);
+                }
             } else {
-                await sendRequest(user.uid);
+                await sendRequest(targetUserId);
             }
         } catch (err) {
             alert(err.message || 'Action failed. Please try again.');

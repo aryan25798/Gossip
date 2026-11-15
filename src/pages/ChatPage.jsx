@@ -102,18 +102,16 @@ const ChatPage = () => {
                     }
 
                     // Not a conversation ID: check if 'id' is a target user's UUID for 1-on-1 chat
-                    const { data: targetUser } = await supabase
-                        .from('users')
-                        .select('*')
-                        .eq('id', id)
-                        .maybeSingle();
-
-                    if (targetUser) {
-                        const directConvId = await chatService.createDirectChat(currentUserId, targetUser.id);
+                    try {
+                        const directConvId = await chatService.createDirectChat(currentUserId, id);
                         if (!isCancelled && directConvId) {
-                            navigate(`/c/${directConvId}`, { replace: true });
+                            if (directConvId !== id) {
+                                navigate(`/c/${directConvId}`, { replace: true });
+                            }
                             return;
                         }
+                    } catch (directErr) {
+                        console.warn("[ChatPage] Target UUID is not a conversation nor a direct user:", directErr);
                     }
                 }
 

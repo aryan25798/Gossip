@@ -86,17 +86,25 @@ export default function ChatWindow({ chat, setChat }) {
 
     // Context & Presence
     const [presence, setPresence] = useState(null);
-    const otherUid = chat?.participants?.find?.(uid => uid !== currentUser.uid);
+    const myUid = currentUser?.uid || currentUser?.id;
+    const otherUid = chat?.participants?.find?.(uid => uid !== myUid) || (chat?.participants?.length === 1 ? chat.participants[0] : null);
     const otherUser = useMemo(() => {
         if (chat?.type === 'group') {
             return { displayName: chat.groupName, photoURL: chat.groupImage, isGroup: true, uid: chat.id };
         }
         const isGemini = otherUid === GEMINI_BOT_ID || chat?.type === 'gemini';
-        if (chat?.participantInfo && otherUid) {
+        if (chat?.participantInfo && otherUid && chat.participantInfo[otherUid]) {
             return { uid: otherUid, ...chat.participantInfo[otherUid], isGemini };
         }
-        return { uid: otherUid, displayName: isGemini ? 'Gemini AI' : 'User', photoURL: isGemini ? "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/google-gemini-icon.png" : null, isGemini };
-    }, [chat?.type, chat?.groupName, chat?.groupImage, chat?.participantInfo, otherUid, chat?.id]);
+        const isSelf = otherUid === myUid;
+        return {
+            uid: otherUid,
+            displayName: isGemini ? 'Gemini AI' : (isSelf ? 'You (Message yourself)' : (chat?.name || chat?.displayName || 'User')),
+            photoURL: isGemini ? "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/google-gemini-icon.png" : (chat?.photoURL || null),
+            isGemini,
+            isSelf
+        };
+    }, [chat, otherUid, myUid]);
 
     // Handlers
     const scrollToBottom = useCallback(() => {
@@ -296,11 +304,13 @@ export default function ChatWindow({ chat, setChat }) {
 
     const { getFriendStatus, loading: friendsLoading } = useFriend() || {};
     const friendStatus = useMemo(() => {
-        if (!otherUser?.uid || friendsLoading) return 'friend'; // Default to assuming friend during quick loads to prevent flicker
-        return typeof getFriendStatus === 'function' ? getFriendStatus(otherUser.uid) : 'friend';
-    }, [otherUser?.uid, getFriendStatus, friendsLoading]);
+        const targetId = otherUser?.uid || otherUser?.id;
+        if (!targetId || otherUser?.isGroup || otherUser?.isGemini || otherUser?.isSelf || targetId === myUid) return 'friend';
+        if (friendsLoading) return 'friend';
+        return typeof getFriendStatus === 'function' ? getFriendStatus(targetId) : 'none';
+    }, [otherUser, getFriendStatus, friendsLoading, myUid]);
 
-    const canMessage = otherUser.isGroup || friendStatus === 'friend' || otherUser.isGemini;
+    const canMessage = otherUser.isGroup || otherUser.isGemini || otherUser.isSelf || friendStatus === 'friend';
 
     const handleShowInfo = useCallback(() => setShowContactInfo(true), []);
     const handleToggleSearch = useCallback(() => setShowSearch(prev => !prev), []);

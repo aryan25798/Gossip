@@ -33,7 +33,9 @@ export const postStatus = async (user, type, content, caption = "", background =
             .insert({
                 user_id: userId,
                 type,
+                media_type: type,
                 content: contentUrl,
+                content_url: contentUrl,
                 caption: caption || '',
                 background: type === 'text' ? background : null,
                 expires_at: expiresAt
@@ -50,14 +52,37 @@ export const subscribeToMyStatus = (userId, callback) => {
     if (!userId) return () => {};
 
     const loadMyStatus = async () => {
-        const { data } = await supabase
-            .from('user_statuses')
-            .select('*')
-            .eq('user_id', userId)
-            .gt('expires_at', new Date().toISOString())
-            .order('created_at', { ascending: false });
+        try {
+            const { data } = await supabase
+                .from('user_statuses')
+                .select('*')
+                .eq('user_id', userId)
+                .gt('expires_at', new Date().toISOString())
+                .order('created_at', { ascending: true });
 
-        callback(data || []);
+            if (!data || data.length === 0) {
+                callback(null);
+                return;
+            }
+
+            const formatted = {
+                userId,
+                userName: 'My status',
+                items: data.map(r => ({
+                    id: r.id,
+                    type: r.type,
+                    url: r.content,
+                    content: r.content,
+                    caption: r.caption,
+                    background: r.background,
+                    timestamp: r.created_at
+                }))
+            };
+            callback(formatted);
+        } catch (err) {
+            console.error("[statusService] loadMyStatus error:", err);
+            callback(null);
+        }
     };
 
     loadMyStatus();
@@ -78,14 +103,47 @@ export const subscribeToRecentUpdates = (userId, callback) => {
     if (!userId) return () => {};
 
     const loadRecent = async () => {
-        const { data } = await supabase
-            .from('user_statuses')
-            .select('*, users(id, display_name, avatar_url)')
-            .neq('user_id', userId)
-            .gt('expires_at', new Date().toISOString())
-            .order('created_at', { ascending: false });
+        try {
+            // Postgres RLS policy automatically restricts selectable statuses to accepted friends and unexpired only
+            const { data } = await supabase
+                .from('user_statuses')
+                .select('*, users(id, display_name, avatar_url)')
+                .neq('user_id', userId)
+                .gt('expires_at', new Date().toISOString())
+                .order('created_at', { ascending: true });
 
-        callback(data || []);
+            if (!data || data.length === 0) {
+                callback({ recent: [], viewed: [] });
+                return;
+            }
+
+            const userGroups = new Map();
+            data.forEach(r => {
+                const u = r.users;
+                if (!userGroups.has(r.user_id)) {
+                    userGroups.set(r.user_id, {
+                        userId: r.user_id,
+                        userName: u?.display_name || 'Friend',
+                        userPhoto: u?.avatar_url || `https://api.dicebear.com/7.x/avataaars/svg?seed=${r.user_id}`,
+                        items: []
+                    });
+                }
+                userGroups.get(r.user_id).items.push({
+                    id: r.id,
+                    type: r.type,
+                    url: r.content,
+                    content: r.content,
+                    caption: r.caption,
+                    background: r.background,
+                    timestamp: r.created_at
+                });
+            });
+
+            callback({ recent: Array.from(userGroups.values()), viewed: [] });
+        } catch (err) {
+            console.error("[statusService] loadRecent error:", err);
+            callback({ recent: [], viewed: [] });
+        }
     };
 
     loadRecent();

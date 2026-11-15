@@ -5,8 +5,11 @@ export const subscribeToUserChats = (userId, callback, limitCount = 30) => {
     if (!userId) return () => {};
 
     let isSubscribed = true;
+    let isConnected = false;
+    let disconnectPollInterval = null;
 
     const loadChats = async () => {
+        if (!isSubscribed) return;
         try {
             const chats = await chatService.getUserChats(userId);
             if (isSubscribed) {
@@ -17,10 +20,45 @@ export const subscribeToUserChats = (userId, callback, limitCount = 30) => {
         }
     };
 
+    const startDisconnectPolling = () => {
+        if (disconnectPollInterval || !isSubscribed) return;
+        disconnectPollInterval = setInterval(() => {
+            if (!isConnected && isSubscribed) {
+                loadChats();
+            }
+        }, 6000);
+    };
+
+    const stopDisconnectPolling = () => {
+        if (disconnectPollInterval) {
+            clearInterval(disconnectPollInterval);
+            disconnectPollInterval = null;
+        }
+    };
+
+    const handleVisibilityChange = () => {
+        if (typeof document !== 'undefined' && document.visibilityState === 'visible' && isSubscribed) {
+            loadChats();
+        }
+    };
+
+    const handleOnline = () => {
+        if (isSubscribed) {
+            loadChats();
+        }
+    };
+
+    if (typeof document !== 'undefined') {
+        document.addEventListener('visibilitychange', handleVisibilityChange);
+    }
+    if (typeof window !== 'undefined') {
+        window.addEventListener('online', handleOnline);
+    }
+
     // Initial load
     loadChats();
 
-    // Realtime channel on conversation_participants & conversations
+    // Realtime channel on conversation_participants, conversations, and messages
     const channel = supabase
         .channel(`user_chats_${userId}`)
         .on(
@@ -47,24 +85,43 @@ export const subscribeToUserChats = (userId, callback, limitCount = 30) => {
             }
         )
         .on(
+            'postgres_changes',
+            {
+                event: 'INSERT',
+                schema: 'public',
+                table: 'messages'
+            },
+            () => {
+                loadChats();
+            }
+        )
+        .on(
             'broadcast',
             { event: 'chat_updated' },
             () => {
                 loadChats();
             }
         )
-        .subscribe();
-
-    // Heartbeat fallback polling every 4 seconds to guarantee sidebar stays fresh
-    const intervalId = setInterval(() => {
-        if (isSubscribed) {
-            loadChats();
-        }
-    }, 4000);
+        .subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+                isConnected = true;
+                stopDisconnectPolling();
+                loadChats();
+            } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                isConnected = false;
+                startDisconnectPolling();
+            }
+        });
 
     return () => {
         isSubscribed = false;
-        clearInterval(intervalId);
+        stopDisconnectPolling();
+        if (typeof document !== 'undefined') {
+            document.removeEventListener('visibilitychange', handleVisibilityChange);
+        }
+        if (typeof window !== 'undefined') {
+            window.removeEventListener('online', handleOnline);
+        }
         supabase.removeChannel(channel);
     };
 };
