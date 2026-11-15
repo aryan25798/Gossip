@@ -3,9 +3,10 @@ import { ChatListSkeleton } from "./ui/Skeleton";
 import ChatListItem from "./ChatListItem";
 import { useAuth } from "../contexts/AuthContext";
 import { Avatar } from "./ui/Avatar";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { subscribeToUserChats } from "../services/chatListService";
 import { searchUsers, searchUsersPaged } from "../services/userService";
+import { chatService } from "../services/chatService";
 import { useFriend } from "../contexts/FriendContext";
 import { useChat } from "../contexts/ChatContext";
 import { IoPersonAdd } from "react-icons/io5";
@@ -37,8 +38,25 @@ const SearchAction = React.memo(({ userId }) => {
 
 const ChatList = React.memo(({ searchTerm }) => {
     const { currentUser } = useAuth();
+    const navigate = useNavigate();
     // Use Global Context instead of fragile local cache
     const { chats, loading } = useChat();
+
+    // Handler to directly resolve or create direct chat with selected user
+    const handleOpenDirectChat = async (e, targetUserId) => {
+        e.preventDefault();
+        const currentUid = currentUser?.uid || currentUser?.id;
+        try {
+            const directConvId = await chatService.createDirectChat(currentUid, targetUserId);
+            if (directConvId) {
+                navigate(`/c/${directConvId}`);
+                return;
+            }
+        } catch (err) {
+            console.error("[ChatList] Error creating direct chat:", err);
+        }
+        navigate(`/c/${targetUserId}`);
+    };
 
     // Local search state
     const [searchResults, setSearchResults] = useState([]);
@@ -172,25 +190,13 @@ const ChatList = React.memo(({ searchTerm }) => {
                         }
 
                         // Case 2: User Search Result (Search mode)
-                        const chatId = getChatId(currentUser.uid, item.id);
-                        const chatData = {
-                            id: chatId,
-                            type: 'private',
-                            participants: [currentUser.uid, item.id],
-                            participantInfo: {
-                                [currentUser.uid]: { displayName: currentUser.displayName, photoURL: currentUser.photoURL },
-                                [item.id]: { displayName: item.displayName, photoURL: item.photoURL }
-                            },
-                            isGhost: true
-                        };
-
                         return (
                             <div className="relative group border-b border-border/10 last:border-0 bg-surface hover:bg-surface-elevated transition-all duration-200">
                                 <Link
-                                    to={`/c/${chatId}`}
-                                    state={{ chatData }}
+                                    to={`/c/${item.id}`}
+                                    onClick={(e) => handleOpenDirectChat(e, item.id)}
                                     key={item.id}
-                                    className="flex items-center gap-4 p-4 flex-1 min-w-0"
+                                    className="flex items-center gap-4 p-4 flex-1 min-w-0 cursor-pointer"
                                 >
                                     <Avatar src={item.photoURL} alt={item.displayName} size="lg" />
                                     <div className="flex-1 min-w-0">

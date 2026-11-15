@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { IoArrowBack, IoCheckmark, IoClose, IoPersonAdd, IoPeopleOutline, IoPlanetOutline } from "react-icons/io5";
 import { BsTelephone, BsCameraVideo, BsSearch } from "react-icons/bs";
 import { Avatar } from "../components/ui/Avatar";
@@ -11,8 +11,10 @@ import { useAuth } from "../contexts/AuthContext";
 import { getPagedUsers, searchUsers, searchUsersPaged, getUsersByIds } from "../services/userService";
 import { Virtuoso } from "react-virtuoso";
 import { getChatId } from "../utils/chatUtils";
+import { chatService } from "../services/chatService";
 
 const ContactsPage = () => {
+    const navigate = useNavigate();
     const { startCall } = useCall();
     const { currentUser } = useAuth();
     const { sendRequest, acceptRequest, rejectRequest, getFriendStatus, incomingRequests, friends } = useFriend();
@@ -168,26 +170,31 @@ const ContactsPage = () => {
         const isSent = status === 'sent';
         const isReceived = status === 'received';
 
-        // Generate Canonical Chat ID
-        const chatId = getChatId(currentUser?.uid, contact.id);
+        const handleContactClick = async (e) => {
+            if (!isFriend) {
+                e.preventDefault();
+                return;
+            }
+            e.preventDefault();
+            const currentUid = currentUser?.uid || currentUser?.id;
+            try {
+                const directConvId = await chatService.createDirectChat(currentUid, contact.id);
+                if (directConvId) {
+                    navigate(`/c/${directConvId}`);
+                    return;
+                }
+            } catch (err) {
+                console.error("[ContactsPage] Error opening direct chat:", err);
+            }
+            navigate(`/c/${contact.id}`);
+        };
 
         return (
             <div className="relative group border-b border-border/10 last:border-0 bg-surface hover:bg-surface-elevated transition-all duration-200">
                 <div className="flex items-center gap-4 p-4">
                     <Link
-                        to={`/c/${chatId}`}
-                        state={{
-                            chatData: {
-                                id: chatId,
-                                participants: [currentUser?.uid, contact.id],
-                                type: 'private',
-                                participantInfo: {
-                                    [contact.id]: { displayName: contact.displayName, photoURL: contact.photoURL },
-                                    [currentUser?.uid]: { displayName: currentUser?.displayName, photoURL: currentUser?.photoURL }
-                                }
-                            }
-                        }}
-                        onClick={e => !isFriend && e.preventDefault()}
+                        to={`/c/${contact.id}`}
+                        onClick={handleContactClick}
                         className={`flex items-center gap-4 flex-1 min-w-0 ${isFriend ? 'cursor-pointer' : 'cursor-default'}`}
                     >
                         <div className="relative">
@@ -219,7 +226,7 @@ const ContactsPage = () => {
                             <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
                                 <button className="p-2.5 text-primary bg-primary/5 hover:bg-primary/10 rounded-full transition-colors" onClick={(e) => handleCall(e, contact, 'audio')} title="Audio Call"><BsTelephone className="w-5 h-5" /></button>
                                 <button className="p-2.5 text-primary bg-primary/5 hover:bg-primary/10 rounded-full transition-colors" onClick={(e) => handleCall(e, contact, 'video')} title="Video Call"><BsCameraVideo className="w-5 h-5" /></button>
-                                <Link to={`/c/${chatId}`} className="p-2.5 text-primary bg-primary/5 hover:bg-primary/10 rounded-full transition-colors" title="Message"><IoPeopleOutline className="w-5 h-5" /></Link>
+                                <Link to={`/c/${contact.id}`} onClick={handleContactClick} className="p-2.5 text-primary bg-primary/5 hover:bg-primary/10 rounded-full transition-colors" title="Message"><IoPeopleOutline className="w-5 h-5" /></Link>
                             </div>
                         ) : isSent ? (
                             <span className="flex items-center gap-2 text-xs font-bold text-text-2 bg-surface-elevated pl-3 pr-4 py-2 rounded-full border border-border/50 select-none shadow-sm">

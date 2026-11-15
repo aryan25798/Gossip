@@ -1,13 +1,16 @@
 import React, { useState, useEffect } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import { supabase } from "../supabase";
 import { chatService } from "../services/chatService";
 import ChatWindow from "../components/ChatWindow";
 import { usePresence } from "../contexts/PresenceContext";
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const ChatPage = () => {
     const { id } = useParams();
+    const location = useLocation();
     const { currentUser } = useAuth();
     const currentUserId = currentUser?.uid || currentUser?.id;
     const { updateActiveChat } = usePresence();
@@ -24,59 +27,110 @@ const ChatPage = () => {
         const loadChat = async () => {
             setLoading(true);
             try {
-                // 1. Try fetching conversation by ID
-                const { data: conv } = await supabase
-                    .from('conversations')
-                    .select('*')
-                    .eq('id', id)
-                    .maybeSingle();
-
-                if (conv) {
-                    // Fetch participants
-                    const { data: parts } = await supabase
-                        .from('conversation_participants')
-                        .select('user_id, role, users(*)')
-                        .eq('conversation_id', conv.id);
-
-                    const otherParticipant = parts?.find(p => p.user_id !== currentUserId)?.users;
-
-                    const formattedChat = {
-                        id: conv.id,
-                        type: conv.type,
-                        name: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : conv.title,
-                        displayName: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : conv.title,
-                        photoURL: conv.type === 'direct' ? otherParticipant?.avatar_url : conv.avatar_url,
-                        participants: parts?.map(p => p.user_id) || [],
-                        participantDetails: parts?.map(p => p.users) || [],
-                        otherUser: otherParticipant ? {
-                            uid: otherParticipant.id,
-                            id: otherParticipant.id,
-                            displayName: otherParticipant.display_name,
-                            photoURL: otherParticipant.avatar_url,
-                            aboutStatus: otherParticipant.about_status
-                        } : null
-                    };
-
-                    if (!isCancelled) {
-                        setChat(formattedChat);
-                        setLoading(false);
+                // Case 1: Composite ID (e.g. user1_user2 from search or legacy links)
+                if (id.includes('_')) {
+                    const parts = id.split('_');
+                    const targetUserId = parts.find(p => p !== currentUserId && UUID_REGEX.test(p)) || parts.find(p => UUID_REGEX.test(p));
+                    if (targetUserId) {
+                        try {
+                            const directConvId = await chatService.createDirectChat(currentUserId, targetUserId);
+                            if (!isCancelled && directConvId) {
+                                navigate(`/c/${directConvId}`, { replace: true });
+                                return;
+                            }
+                        } catch (createErr) {
+                            console.error("[ChatPage] Error creating direct chat from composite ID:", createErr);
+                        }
                     }
-                    return;
                 }
 
-                // 2. If conv not found by ID, maybe 'id' is a target user's UUID for 1-on-1 chat
-                const { data: targetUser } = await supabase
-                    .from('users')
-                    .select('*')
-                    .eq('id', id)
-                    .maybeSingle();
+                // Case 2: Standard UUID
+                if (UUID_REGEX.test(id)) {
+                    // Try fetching conversation by ID
+                    const { data: conv, error: convErr } = await supabase
+                        .from('conversations')
+                        .select('*')
+                        .eq('id', id)
+                        .maybeSingle();
 
-                if (targetUser) {
-                    const directConvId = await chatService.createDirectChat(currentUserId, targetUser.id);
-                    if (!isCancelled) {
-                        navigate(`/c/${directConvId}`, { replace: true });
+                    if (conv && !convErr) {
+                        // Fetch participants
+                        const { data: parts } = await supabase
+                            .from('conversation_participants')
+                            .select('user_id, role, users(*)')
+                            .eq('conversation_id', conv.id);
+
+                        const otherParticipant = parts?.find(p => p.user_id !== currentUserId)?.users;
+
+                        const participantInfo = {};
+                        if (parts) {
+                            parts.forEach(p => {
+                                if (p.users) {
+                                    participantInfo[p.user_id] = {
+                                        displayName: p.users.display_name,
+                                        photoURL: p.users.avatar_url,
+                                        about: p.users.about_status,
+                                        email: p.users.email
+                                    };
+                                }
+                            });
+                        }
+
+                        const formattedChat = {
+                            id: conv.id,
+                            type: conv.type,
+                            name: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : (conv.title || 'Group Chat'),
+                            displayName: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : (conv.title || 'Group Chat'),
+                            photoURL: conv.type === 'direct' ? otherParticipant?.avatar_url : conv.avatar_url,
+                            participants: parts?.map(p => p.user_id) || [],
+                            participantDetails: parts?.map(p => p.users) || [],
+                            participantInfo,
+                            otherUser: otherParticipant ? {
+                                uid: otherParticipant.id,
+                                id: otherParticipant.id,
+                                displayName: otherParticipant.display_name,
+                                photoURL: otherParticipant.avatar_url,
+                                aboutStatus: otherParticipant.about_status
+                            } : null
+                        };
+
+                        if (!isCancelled) {
+                            setChat(formattedChat);
+                            setLoading(false);
+                        }
+                        return;
                     }
-                    return;
+
+                    // Not a conversation ID: check if 'id' is a target user's UUID for 1-on-1 chat
+                    const { data: targetUser } = await supabase
+                        .from('users')
+                        .select('*')
+                        .eq('id', id)
+                        .maybeSingle();
+
+                    if (targetUser) {
+                        const directConvId = await chatService.createDirectChat(currentUserId, targetUser.id);
+                        if (!isCancelled && directConvId) {
+                            navigate(`/c/${directConvId}`, { replace: true });
+                            return;
+                        }
+                    }
+                }
+
+                // Case 3: Ghost chat or location state fallback
+                if (location.state?.chatData?.participants) {
+                    const targetUserId = location.state.chatData.participants.find(p => p !== currentUserId && UUID_REGEX.test(p));
+                    if (targetUserId) {
+                        try {
+                            const directConvId = await chatService.createDirectChat(currentUserId, targetUserId);
+                            if (!isCancelled && directConvId) {
+                                navigate(`/c/${directConvId}`, { replace: true });
+                                return;
+                            }
+                        } catch (stateErr) {
+                            console.error("[ChatPage] Error creating chat from state fallback:", stateErr);
+                        }
+                    }
                 }
 
                 // Chat not found
@@ -94,7 +148,7 @@ const ChatPage = () => {
         return () => {
             isCancelled = true;
         };
-    }, [id, currentUserId, navigate, updateActiveChat]);
+    }, [id, currentUserId, navigate, updateActiveChat, location.state]);
 
     if (loading) {
         return (
