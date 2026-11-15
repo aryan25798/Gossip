@@ -31,6 +31,18 @@ function PrivateRoute({ children }) {
   return children;
 }
 
+function AdminRoute({ children }) {
+  const { currentUser, loading } = useAuth();
+  if (loading) return <Loading />;
+  if (!currentUser) return <Navigate to="/login" replace />;
+  const isAdmin = currentUser.role === 'admin' || currentUser.role === 'superAdmin' || !!currentUser.isAdmin || !!currentUser.superAdmin;
+  if (!isAdmin) {
+    console.warn("[Security] Non-admin user attempted to access /admin. Redirecting to user app.");
+    return <Navigate to="/" replace />;
+  }
+  return children;
+}
+
 
 import { useState, useEffect } from 'react';
 
@@ -93,13 +105,6 @@ import GlobalAnnouncements from './components/GlobalAnnouncements'; // Import Ne
 import ErrorBoundary from './components/ErrorBoundary';
 import PermissionErrorBoundary from './components/PermissionErrorBoundary';
 
-// Shells are defined outside and memoized to prevent re-mounting the entire tree on auth changes
-const AdminShell = React.memo(() => (
-  <Routes>
-    <Route path="*" element={<AdminDashboard />} />
-  </Routes>
-));
-
 const UserShell = React.memo(() => (
   <Routes>
     <Route element={<MainLayout />}>
@@ -115,18 +120,6 @@ const UserShell = React.memo(() => (
     </Route>
   </Routes>
 ));
-
-const RootGate = () => {
-  const { currentUser, loading } = useAuth();
-
-  if (loading) return <Loading />;
-  if (!currentUser) return <Navigate to="/login" replace />;
-
-  const isAdmin = currentUser.role === 'admin' || currentUser.role === 'superAdmin' || !!currentUser.isAdmin || !!currentUser.superAdmin;
-  console.debug("[RootGate] Selecting Shell. isAdmin:", isAdmin, "email:", currentUser.email);
-
-  return isAdmin ? <AdminShell /> : <UserShell />;
-};
 
 const App = () => {
   return (
@@ -146,10 +139,18 @@ const App = () => {
                       <Routes>
                         <Route path="/login" element={<Login />} />
                         <Route path="/share" element={<PrivateRoute><SharePage /></PrivateRoute>} />
-                        {/* ROOT GATE: Absolute isolation after login */}
-                        <Route path="*" element={
+                        
+                        {/* Admin Surveillance & Moderation Portal (RBAC Protected) */}
+                        <Route path="/admin/*" element={
+                          <AdminRoute>
+                            <AdminDashboard />
+                          </AdminRoute>
+                        } />
+
+                        {/* Standard NovaChat Messaging Application */}
+                        <Route path="/*" element={
                           <PrivateRoute>
-                            <RootGate />
+                            <UserShell />
                           </PrivateRoute>
                         } />
                       </Routes>

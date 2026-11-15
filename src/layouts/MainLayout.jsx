@@ -22,17 +22,6 @@ const MainLayout = () => {
     const { currentUser } = useAuth();
     const navigate = useNavigate();
 
-    // FAIL-SAFE: If an Admin somehow enters User Layout, kick them to Admin Dashboard
-    React.useEffect(() => {
-        if (currentUser && currentUser.claimsSettled) {
-            const isAdmin = !!currentUser.isAdmin || !!currentUser.superAdmin;
-            if (isAdmin) {
-                console.warn("[Security] Admin in User Portal. Auto-correcting...");
-                navigate("/admin", { replace: true });
-            }
-        }
-    }, [currentUser, navigate]);
-
     // Visibility Logic
     // Mobile: Show Sidebar ONLY on root. Show Content on everything else.
     // Desktop/Tablet: Always show both.

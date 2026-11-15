@@ -209,7 +209,7 @@ export const AdminDashboard = () => {
                     <div className="flex items-center gap-2 sm:gap-3 shrink-0 min-w-0">
                         {/* Return to Chat App Button */}
                         <button
-                            onClick={() => navigate('/chat')}
+                            onClick={() => navigate('/')}
                             className="p-1.5 sm:px-3 sm:py-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 transition-colors shrink-0 flex items-center gap-1.5"
                             title="Return to NovaChat Messenger"
                         >

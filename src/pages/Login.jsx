@@ -8,7 +8,9 @@ export default function Login() {
     const navigate = useNavigate();
     
     // Auth Mode: 'login' | 'register' | 'admin'
-    const [mode, setMode] = useState('login');
+    const searchParams = new URLSearchParams(window.location.search);
+    const initialMode = searchParams.get('mode') === 'admin' ? 'admin' : (searchParams.get('mode') === 'register' ? 'register' : 'login');
+    const [mode, setMode] = useState(initialMode);
     const [displayName, setDisplayName] = useState("");
     const [email, setEmail] = useState("");
     const [password, setPassword] = useState("");
@@ -16,8 +18,11 @@ export default function Login() {
     const [status, setStatus] = useState({ error: "", success: "" });
 
     useEffect(() => {
-        if (currentUser) {
-            if (currentUser.isAdmin || currentUser.role === 'admin' || currentUser.role === 'superAdmin' || mode === 'admin') {
+        if (currentUser && currentUser.claimsSettled) {
+            const isAdmin = !!currentUser.isAdmin || currentUser.role === 'admin' || currentUser.role === 'superAdmin' || currentUser.email === 'admin@novachat.app';
+            if (isAdmin && (mode === 'admin' || window.location.search.includes('mode=admin'))) {
+                navigate("/admin", { replace: true });
+            } else if (isAdmin) {
                 navigate("/admin", { replace: true });
             } else {
                 navigate("/", { replace: true });
