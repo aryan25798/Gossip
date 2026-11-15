@@ -12,11 +12,14 @@ const ChatListItem = memo(({ chat, currentUserId }) => {
     const otherUserId = chat.participants?.find(uid => uid !== currentUserId);
     const userInfo = chat.participantInfo?.[otherUserId] || chat.participantDetails?.find(u => (u.id || u.uid) === otherUserId);
 
+    const resolvedChatName = (chat.name && chat.name !== 'Direct Chat' && chat.name !== 'User') ? chat.name : (chat.displayName || null);
+    const resolvedUserName = (userInfo?.displayName && userInfo.displayName !== 'User') ? userInfo.displayName : (userInfo?.display_name || null);
+
     // Determine metadata for Group or Private chat
     const displayInfo = {
         name: chat.type === 'group'
             ? (chat.groupName || chat.title || chat.name || "Group")
-            : (userInfo?.displayName || userInfo?.display_name || chat.name || chat.chatName || chat.displayName || "User"),
+            : (resolvedUserName || resolvedChatName || "User"),
         photo: chat.type === 'group'
             ? (chat.photoURL || chat.groupImage)
             : (userInfo?.photoURL || userInfo?.avatar_url || chat.photoURL || chat.avatar_url),

@@ -561,6 +561,12 @@ export const chatService = {
             const conv = p.conversations;
             if (!conv) continue;
 
+            // WhatsApp behavior: In direct chats, only show conversations that have actual messages exchanged
+            const hasMessages = Boolean(conv.last_message_text || conv.last_message_at);
+            if (conv.type === 'direct' && !hasMessages) {
+                continue;
+            }
+
             // Fetch other participants details
             const { data: members } = await supabase
                 .from('conversation_participants')
@@ -581,8 +587,14 @@ export const chatService = {
                 });
             }
 
-            const resolvedName = conv.type === 'direct' ? (otherUser?.display_name || 'Direct Chat') : (conv.title || 'Group');
-            const resolvedPhoto = conv.type === 'direct' ? otherUser?.avatar_url : conv.avatar_url;
+            const isSelf = conv.type === 'direct' && (!otherUser || members?.every(m => m.user_id === userId));
+            const selfUser = members?.find(m => m.user_id === userId)?.users;
+            const resolvedName = conv.type === 'direct'
+                ? (isSelf ? 'You (Message yourself)' : (otherUser?.display_name || 'User'))
+                : (conv.title || 'Group');
+            const resolvedPhoto = conv.type === 'direct'
+                ? (isSelf ? selfUser?.avatar_url : otherUser?.avatar_url)
+                : conv.avatar_url;
 
             chats.push({
                 id: conv.id,
@@ -610,45 +622,26 @@ export const chatService = {
         });
     },
 
-    // 12. Create Direct Chat (idempotent lookup)
+    // 12. Create Direct Chat (idempotent lookup via PostgreSQL atomic RPC)
     createDirectChat: async (currentUserId, targetUserId) => {
         if (!currentUserId || !targetUserId) return null;
 
-        // Handle self-chat case (e.g. "Message yourself" / Notes)
-        if (currentUserId === targetUserId) {
-            const { data: selfChats } = await supabase
-                .from('conversations')
-                .select('id, type, created_by')
-                .eq('created_by', currentUserId)
-                .eq('type', 'direct');
-
-            if (selfChats && selfChats.length > 0) {
-                for (const sc of selfChats) {
-                    const { data: parts } = await supabase
-                        .from('conversation_participants')
-                        .select('user_id')
-                        .eq('conversation_id', sc.id);
-                    if (parts && parts.length === 1 && parts[0].user_id === currentUserId) {
-                        return sc.id;
-                    }
-                }
+        try {
+            const { data, error } = await supabase.rpc('get_or_create_direct_chat', {
+                p_user_1: currentUserId,
+                p_user_2: targetUserId
+            });
+            if (!error && data) {
+                return data;
             }
-
-            const { data: conv, error: convErr } = await supabase
-                .from('conversations')
-                .insert({ type: 'direct', created_by: currentUserId })
-                .select()
-                .maybeSingle();
-
-            if (convErr) throw convErr;
-
-            await supabase.from('conversation_participants').insert([
-                { conversation_id: conv.id, user_id: currentUserId, role: 'owner' }
-            ]);
-            return conv.id;
+            if (error) {
+                console.warn('[chatService] RPC get_or_create_direct_chat error:', error);
+            }
+        } catch (rpcErr) {
+            console.warn('[chatService] RPC invocation failed, fallback to client query:', rpcErr);
         }
 
-        // Standard direct chat between distinct users
+        // Fallback for direct chat between distinct users
         const { data: userChats } = await supabase
             .from('conversation_participants')
             .select('conversation_id, conversations!inner(type)')

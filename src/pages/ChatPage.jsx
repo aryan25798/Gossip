@@ -60,7 +60,18 @@ const ChatPage = () => {
                             .select('user_id, role, users(*)')
                             .eq('conversation_id', conv.id);
 
-                        const otherParticipant = parts?.find(p => p.user_id !== currentUserId)?.users;
+                        let otherParticipant = parts?.find(p => p.user_id !== currentUserId)?.users;
+                        const selfParticipant = parts?.find(p => p.user_id === currentUserId)?.users;
+                        const isSelf = conv.type === 'direct' && (!otherParticipant || parts?.every(p => p.user_id === currentUserId));
+
+                        // Hardening: If direct chat and joined users is null, fetch directly from users table
+                        if (conv.type === 'direct' && !isSelf && !otherParticipant) {
+                            const otherPartUserId = parts?.find(p => p.user_id !== currentUserId)?.user_id;
+                            if (otherPartUserId) {
+                                const { data: uData } = await supabase.from('users').select('*').eq('id', otherPartUserId).maybeSingle();
+                                if (uData) otherParticipant = uData;
+                            }
+                        }
 
                         const participantInfo = {};
                         if (parts) {
@@ -76,22 +87,35 @@ const ChatPage = () => {
                             });
                         }
 
+                        const resolvedName = conv.type === 'direct'
+                            ? (isSelf ? 'You (Message yourself)' : (otherParticipant?.display_name || 'Direct Chat'))
+                            : (conv.title || 'Group Chat');
+                        const resolvedPhoto = conv.type === 'direct'
+                            ? (isSelf ? selfParticipant?.avatar_url : otherParticipant?.avatar_url)
+                            : conv.avatar_url;
+
                         const formattedChat = {
                             id: conv.id,
                             type: conv.type,
-                            name: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : (conv.title || 'Group Chat'),
-                            displayName: conv.type === 'direct' ? (otherParticipant?.display_name || 'Direct Chat') : (conv.title || 'Group Chat'),
-                            photoURL: conv.type === 'direct' ? otherParticipant?.avatar_url : conv.avatar_url,
+                            name: resolvedName,
+                            displayName: resolvedName,
+                            photoURL: resolvedPhoto,
                             participants: parts?.map(p => p.user_id) || [],
-                            participantDetails: parts?.map(p => p.users) || [],
+                            participantDetails: parts?.map(p => p.users).filter(Boolean) || [],
                             participantInfo,
-                            otherUser: otherParticipant ? {
+                            otherUser: isSelf ? {
+                                uid: currentUserId,
+                                id: currentUserId,
+                                displayName: 'You (Message yourself)',
+                                photoURL: selfParticipant?.avatar_url,
+                                aboutStatus: selfParticipant?.about_status
+                            } : (otherParticipant ? {
                                 uid: otherParticipant.id,
                                 id: otherParticipant.id,
                                 displayName: otherParticipant.display_name,
                                 photoURL: otherParticipant.avatar_url,
                                 aboutStatus: otherParticipant.about_status
-                            } : null
+                            } : null)
                         };
 
                         if (!isCancelled) {

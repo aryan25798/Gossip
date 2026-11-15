@@ -38,6 +38,7 @@ const SearchAction = React.memo(({ userId }) => {
 
 const ChatList = React.memo(({ searchTerm }) => {
     const { currentUser } = useAuth();
+    const currentUid = currentUser?.uid || currentUser?.id;
     const navigate = useNavigate();
     // Use Global Context instead of fragile local cache
     const { chats, loading } = useChat();
@@ -45,7 +46,6 @@ const ChatList = React.memo(({ searchTerm }) => {
     // Handler to directly resolve or create direct chat with selected user
     const handleOpenDirectChat = async (e, targetUserId) => {
         e.preventDefault();
-        const currentUid = currentUser?.uid || currentUser?.id;
         try {
             const directConvId = await chatService.createDirectChat(currentUid, targetUserId);
             if (directConvId) {
@@ -65,9 +65,6 @@ const ChatList = React.memo(({ searchTerm }) => {
     const [searching, setSearching] = useState(false);
     const [loadingMoreSearch, setLoadingMoreSearch] = useState(false);
 
-    // Subscription moved to ChatContext
-
-
     // Filter AND Sort existing chats locally
     const filteredChats = useMemo(() => {
         let result = chats;
@@ -86,7 +83,7 @@ const ChatList = React.memo(({ searchTerm }) => {
 
     useEffect(() => {
         const handleSearch = async () => {
-            if (!searchTerm || !searchTerm.trim()) {
+            if (!searchTerm || !searchTerm.trim() || !currentUid) {
                 setSearchResults([]);
                 setSearchLastDoc(null);
                 setSearchHasMore(false);
@@ -95,7 +92,7 @@ const ChatList = React.memo(({ searchTerm }) => {
             }
             setSearching(true);
             try {
-                const { users, lastDoc: newLastDoc } = await searchUsersPaged(searchTerm, currentUser.uid, null, 15);
+                const { users, lastDoc: newLastDoc } = await searchUsersPaged(searchTerm, currentUid, null, 15);
                 setSearchResults(users);
                 setSearchLastDoc(newLastDoc);
                 setSearchHasMore(users.length === 15);
@@ -108,14 +105,14 @@ const ChatList = React.memo(({ searchTerm }) => {
 
         const timeout = setTimeout(handleSearch, 500);
         return () => clearTimeout(timeout);
-    }, [searchTerm, currentUser?.uid]);
+    }, [searchTerm, currentUid]);
 
     const loadMoreSearchResults = async () => {
-        if (loadingMoreSearch || !searchHasMore || !searchTerm) return;
+        if (loadingMoreSearch || !searchHasMore || !searchTerm || !currentUid) return;
 
         setLoadingMoreSearch(true);
         try {
-            const { users, lastDoc: newLastDoc } = await searchUsersPaged(searchTerm, currentUser.uid, searchLastDoc, 15);
+            const { users, lastDoc: newLastDoc } = await searchUsersPaged(searchTerm, currentUid, searchLastDoc, 15);
             if (users.length > 0) {
                 setSearchResults(prev => [...prev, ...users]);
                 setSearchLastDoc(newLastDoc);
@@ -148,7 +145,7 @@ const ChatList = React.memo(({ searchTerm }) => {
         // Deduplicate: Exclude users from searchResults if they already appear in filteredChats
         const activeChatUserIds = new Set(
             chats.flatMap(c => c.participants || [])
-                .filter(uid => uid !== currentUser.uid)
+                .filter(uid => uid !== currentUid)
         );
 
         const uniquePeopleResults = searchResults.filter(u => !activeChatUserIds.has(u.id));
@@ -186,7 +183,7 @@ const ChatList = React.memo(({ searchTerm }) => {
 
                         // Case 1: Active Chat Item
                         if (item.participants || item.lastMessage) {
-                            return <ChatListItem key={item.id} chat={item} currentUserId={currentUser.uid} />;
+                            return <ChatListItem key={item.id} chat={item} currentUserId={currentUid} />;
                         }
 
                         // Case 2: User Search Result (Search mode)
@@ -248,8 +245,8 @@ const ChatList = React.memo(({ searchTerm }) => {
                 style={{ height: '100%', width: '100%' }}
                 defaultItemHeight={72}
                 itemContent={(index, chat) => {
-                    if (!chat || !currentUser) return null;
-                    return <ChatListItem key={chat.id} chat={chat} currentUserId={currentUser.uid} />;
+                    if (!chat || !currentUid) return null;
+                    return <ChatListItem key={chat.id} chat={chat} currentUserId={currentUid} />;
                 }}
                 components={{
                     Header: () => <div className="h-2" />,
